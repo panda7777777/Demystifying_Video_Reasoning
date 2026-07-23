@@ -1,0 +1,1 @@
+move the car to the red target instead of blue target

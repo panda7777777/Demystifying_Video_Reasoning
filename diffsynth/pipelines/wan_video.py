@@ -1,13 +1,11 @@
-import torch, types
-import numpy as np
-from PIL import Image
-from einops import repeat
+import types
 from typing import Optional, Union
-from einops import rearrange
+
 import numpy as np
+import torch
+from einops import rearrange, repeat
 from PIL import Image
 from tqdm import tqdm
-from typing import Optional
 from typing_extensions import Literal
 from transformers import Wav2Vec2Processor
 
@@ -179,7 +177,8 @@ class WanVideoPipeline(BasePipeline):
             pipe.audio_processor = Wav2Vec2Processor.from_pretrained(audio_processor_config.path)
         
         # Unified Sequence Parallel
-        if use_usp: pipe.enable_usp()
+        if use_usp:
+            pipe.enable_usp()
         
         # VRAM Management
         pipe.vram_management_enabled = pipe.check_vram_management_state()
@@ -270,9 +269,16 @@ class WanVideoPipeline(BasePipeline):
         step_callback=None,
         # Set of step indices to visualize (skip VAE decode for steps not in this set)
         vis_steps=None,
+        # Maximum number of denoising steps to execute.
+        max_denoising_steps: Optional[int] = None,
     ):
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
+        if max_denoising_steps is not None and not 1 <= max_denoising_steps <= len(self.scheduler.timesteps):
+            raise ValueError(
+                "max_denoising_steps must be between 1 and the number of "
+                "scheduled timesteps"
+            )
         
         # Inputs
         inputs_posi = {
@@ -315,7 +321,7 @@ class WanVideoPipeline(BasePipeline):
         models = {name: getattr(self, name) for name in self.in_iteration_models}
         for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
             # Switch DiT if necessary
-            if timestep.item() < switch_DiT_boundary * 1000 and self.dit2 is not None and not models["dit"] is self.dit2:
+            if timestep.item() < switch_DiT_boundary * 1000 and self.dit2 is not None and models["dit"] is not self.dit2:
                 self.load_models_to_device(self.in_iteration_models_2)
                 models["dit"] = self.dit2
                 models["vace"] = self.vace2
@@ -340,28 +346,44 @@ class WanVideoPipeline(BasePipeline):
             if "first_frame_latents" in inputs_shared:
                 inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
 
-            if step_callback is not None and (vis_steps is None or progress_id in vis_steps):
-                self.load_models_to_device(['vae'])
+            should_visualize = step_callback is not None and (
+                vis_steps is None or progress_id in vis_steps
+            )
+            should_stop = (
+                max_denoising_steps is not None
+                and progress_id + 1 >= max_denoising_steps
+            )
+            x0_hat = None
+            if should_visualize or should_stop:
                 x0_hat = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents_before_step, to_final=True)
                 if "first_frame_latents" in inputs_shared:
                     x0_hat[:, :, 0:1] = inputs_shared["first_frame_latents"]
+
+            if should_visualize:
+                self.load_models_to_device(['vae'])
+                visualization_latents = x0_hat
                 # Handle VACE reference image prefix
                 if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):
                     if vace_reference_image is not None and isinstance(vace_reference_image, list):
                         f_offset = len(vace_reference_image)
                     else:
                         f_offset = 1
-                    x0_hat = x0_hat[:, :, f_offset:]
-                step_video = self.vae.decode(x0_hat, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+                    visualization_latents = visualization_latents[:, :, f_offset:]
+                step_video = self.vae.decode(visualization_latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
                 step_video = self.vae_output_to_video(step_video)
                 step_callback(progress_id, num_inference_steps, step_video)
-                self.load_models_to_device(self.in_iteration_models)
-                # Re-set models after reloading (in case DiT was switched)
-                models = {name: getattr(self, name) for name in self.in_iteration_models}
-                if timestep.item() < switch_DiT_boundary * 1000 and self.dit2 is not None:
-                    self.load_models_to_device(self.in_iteration_models_2)
-                    models["dit"] = self.dit2
-                    models["vace"] = self.vace2
+                if not should_stop:
+                    self.load_models_to_device(self.in_iteration_models)
+                    # Re-set models after reloading (in case DiT was switched)
+                    models = {name: getattr(self, name) for name in self.in_iteration_models}
+                    if timestep.item() < switch_DiT_boundary * 1000 and self.dit2 is not None:
+                        self.load_models_to_device(self.in_iteration_models_2)
+                        models["dit"] = self.dit2
+                        models["vace"] = self.vace2
+
+            if should_stop:
+                inputs_shared["latents"] = x0_hat
+                break
 
         # VACE (TODO: remove it)
         if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):
@@ -1454,15 +1476,6 @@ def model_fn_wan_video(
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
     
-    # ChronoEdit temporal skip RoPE: anchor input at position 0, output at position T-1
-    temporal_skip_len = kwargs.get("temporal_skip_len")
-    if temporal_skip_len is not None and temporal_skip_len > f:
-        # Image edit case (f=2): use positions [0, temporal_skip_len-1]
-        temporal_indices = [0] + [temporal_skip_len - 1] * (f - 1)
-        temporal_freqs = torch.stack([dit.freqs[0][i] for i in temporal_indices])
-    else:
-        temporal_freqs = dit.freqs[0][:f]
-
     freqs = torch.cat([
         dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
         dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),

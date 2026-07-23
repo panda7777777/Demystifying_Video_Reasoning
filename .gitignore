@@ -25,3 +25,15 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
+# Environments
+.venv/
+venv/
+
+# Model checkpoints, datasets, run outputs (never committed)
+/models/
+/data/
+/output/
+*.log
+/build/
+/dist/

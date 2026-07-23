@@ -1,223 +1,166 @@
 #!/usr/bin/env python3
-"""
-Custom Input - Per-Diffusion-Step Visualization
-================================================
+"""Generate a video and decoded predictions for selected denoising steps."""
 
-Run step visualization on a single image + text prompt.
-No VBVR-Bench data required.
+from __future__ import annotations
 
-Usage:
-    python tools/custom_step_visualization.py \
-        --model wan2.2 \
-        --image ./my_image.png \
-        --prompt "A cat walks across the room" \
-        --output_dir ./output/custom_step \
-        --num_frames 81
-"""
-
-import torch
-import json
-import os
 import argparse
+import sys
+from pathlib import Path
+
 from PIL import Image
 
-from diffsynth.utils.data import save_video
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from scripts._visualization import (  # noqa: E402
+    GenerationConfig,
+    SUPPORTED_MODELS,
+    atomic_write_json,
+    build_pipeline,
+    default_negative_prompt,
+    make_step_callback,
+    parse_visualization_steps,
+)
 
 
-def parse_vis_steps(spec):
-    if spec == 'all':
-        return None
-    steps = set()
-    for part in spec.split(','):
-        part = part.strip()
-        if '-' in part:
-            lo, hi = part.split('-', 1)
-            steps.update(range(int(lo), int(hi) + 1))
-        else:
-            steps.add(int(part))
-    return steps
-
-
-def make_step_callback(step_output_dir, fps=16):
-    os.makedirs(step_output_dir, exist_ok=True)
-    def step_callback(step_idx, total_steps, step_video):
-        step_path = os.path.join(step_output_dir, f"step_{step_idx:03d}.mp4")
-        save_video(step_video, step_path, fps=fps, quality=5)
-        print(f"  Saved step {step_idx}/{total_steps}: {step_path}")
-    return step_callback
-
-
-# ─── Pipeline builders ──────────────────────────────────────────────────────
-
-def build_wan22_pipeline(args, vram_config):
-    from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
-    pipe = WanVideoPipeline.from_pretrained(
-        torch_dtype=torch.bfloat16, device="cuda",
-        redirect_common_files=False,
-        model_configs=[
-            ModelConfig(model_id="Wan-AI/Wan2.2-I2V-A14B", origin_file_pattern="high_noise_model/diffusion_pytorch_model*.safetensors", **vram_config),
-            ModelConfig(model_id="Wan-AI/Wan2.2-I2V-A14B", origin_file_pattern="low_noise_model/diffusion_pytorch_model*.safetensors", **vram_config),
-            ModelConfig(model_id="Wan-AI/Wan2.2-I2V-A14B", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth", **vram_config),
-            ModelConfig(model_id="Wan-AI/Wan2.2-I2V-A14B", origin_file_pattern="Wan2.1_VAE.pth", **vram_config),
-        ],
-        tokenizer_config=ModelConfig(model_id="Wan-AI/Wan2.2-I2V-A14B", origin_file_pattern="google/umt5-xxl/"),
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True, choices=SUPPORTED_MODELS)
+    parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--num-frames", type=int, default=81)
+    parser.add_argument("--num-inference-steps", type=int, default=50)
+    parser.add_argument(
+        "--max-denoising-steps",
+        type=int,
+        help="Maximum number of denoising steps to execute (Wan only)",
     )
-    if args.high_noise_lora_path:
-        pipe.load_lora(pipe.dit, args.high_noise_lora_path, alpha=args.lora_alpha)
-    if args.low_noise_lora_path:
-        pipe.load_lora(pipe.dit2, args.low_noise_lora_path, alpha=args.lora_alpha)
-    return pipe
-
-def build_wan21_pipeline(args, vram_config):
-    from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
-    pipe = WanVideoPipeline.from_pretrained(
-        torch_dtype=torch.bfloat16, device="cuda",
-        redirect_common_files=False,
-        model_configs=[
-            ModelConfig(model_id="Wan-AI/Wan2.1-I2V-14B-720P", origin_file_pattern="diffusion_pytorch_model*.safetensors", **vram_config),
-            ModelConfig(model_id="Wan-AI/Wan2.1-I2V-14B-720P", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth", **vram_config),
-            ModelConfig(model_id="Wan-AI/Wan2.1-I2V-14B-720P", origin_file_pattern="Wan2.1_VAE.pth", **vram_config),
-            ModelConfig(model_id="Wan-AI/Wan2.1-I2V-14B-720P", origin_file_pattern="models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", **vram_config),
-        ],
-        tokenizer_config=ModelConfig(model_id="Wan-AI/Wan2.1-I2V-14B-720P", origin_file_pattern="google/umt5-xxl/"),
+    parser.add_argument(
+        "--visualization-steps",
+        default="all",
+        help="'all' or comma-separated steps/ranges such as '0-9,20-24'",
     )
-    if args.lora_path:
-        pipe.load_lora(pipe.dit, args.lora_path, alpha=args.lora_alpha)
-    return pipe
-
-def build_ltx_pipeline(args, vram_config):
-    from diffsynth.pipelines.ltx2_audio_video import LTX2AudioVideoPipeline, ModelConfig
-    pipe = LTX2AudioVideoPipeline.from_pretrained(
-        torch_dtype=torch.bfloat16, device="cuda",
-        model_configs=[
-            ModelConfig(model_id="google/gemma-3-12b-it-qat-q4_0-unquantized", origin_file_pattern="model-*.safetensors", **vram_config),
-            ModelConfig(model_id="DiffSynth-Studio/LTX-2.3-Repackage", origin_file_pattern="transformer.safetensors", **vram_config),
-            ModelConfig(model_id="DiffSynth-Studio/LTX-2.3-Repackage", origin_file_pattern="text_encoder_post_modules.safetensors", **vram_config),
-            ModelConfig(model_id="DiffSynth-Studio/LTX-2.3-Repackage", origin_file_pattern="video_vae_decoder.safetensors", **vram_config),
-            ModelConfig(model_id="DiffSynth-Studio/LTX-2.3-Repackage", origin_file_pattern="audio_vae_decoder.safetensors", **vram_config),
-            ModelConfig(model_id="DiffSynth-Studio/LTX-2.3-Repackage", origin_file_pattern="audio_vocoder.safetensors", **vram_config),
-            ModelConfig(model_id="DiffSynth-Studio/LTX-2.3-Repackage", origin_file_pattern="video_vae_encoder.safetensors", **vram_config),
-        ],
-        tokenizer_config=ModelConfig(model_id="google/gemma-3-12b-it-qat-q4_0-unquantized"),
-    )
-    if args.lora_path:
-        pipe.load_lora(pipe.dit, args.lora_path, alpha=args.lora_alpha)
-    return pipe
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Per-diffusion-step visualization with custom image + prompt")
-
-    parser.add_argument("--model", type=str, required=True,
-                        choices=["wan2.2", "wan2.1", "ltx2.3"])
-    parser.add_argument("--image", type=str, required=True,
-                        help="Path to input image")
-    parser.add_argument("--prompt", type=str, required=True,
-                        help="Text prompt for generation")
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--num_frames", type=int, default=81)
-
-    lora = parser.add_argument_group("LoRA (optional)")
-    lora.add_argument("--lora_path", type=str, default=None)
-    lora.add_argument("--high_noise_lora_path", type=str, default=None)
-    lora.add_argument("--low_noise_lora_path", type=str, default=None)
-    lora.add_argument("--lora_alpha", type=float, default=1.0)
-
-    parser.add_argument("--vis_steps", type=str, default="all",
-                        help="'all' or ranges like '0-19,45-49'")
-    parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--fps", type=int, default=16)
-    parser.add_argument("--negative_prompt", type=str, default=None)
-    parser.add_argument("--save_noise_schedule", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--negative-prompt")
+    parser.add_argument("--vbvr-model-path", type=Path)
+    parser.add_argument("--lora-path")
+    parser.add_argument("--high-noise-lora-path")
+    parser.add_argument("--low-noise-lora-path")
+    parser.add_argument("--lora-alpha", type=float, default=1.0)
+    parser.add_argument("--save-noise-schedule", action="store_true")
+    return parser.parse_args()
 
-    vis_steps = parse_vis_steps(args.vis_steps)
-    is_ltx = args.model == "ltx2.3"
 
-    vram_config = {
-        "offload_dtype": torch.bfloat16, "offload_device": "cpu",
-        "onload_dtype": torch.bfloat16, "onload_device": "cuda",
-        "preparing_dtype": torch.bfloat16, "preparing_device": "cuda",
-        "computation_dtype": torch.bfloat16, "computation_device": "cuda",
-    }
+def main() -> int:
+    args = parse_args()
+    config = GenerationConfig(
+        model=args.model,
+        num_frames=args.num_frames,
+        num_inference_steps=args.num_inference_steps,
+        max_denoising_steps=args.max_denoising_steps,
+        seed=args.seed,
+        fps=args.fps,
+        negative_prompt=args.negative_prompt,
+    )
+    try:
+        config.validate()
+        visualization_steps = parse_visualization_steps(
+            args.visualization_steps
+        )
+    except ValueError as error:
+        raise SystemExit(f"error: {error}") from error
+    if not args.image.is_file():
+        raise SystemExit(f"error: input image not found: {args.image}")
+    if not args.prompt.strip():
+        raise SystemExit("error: prompt cannot be empty")
 
-    input_image = Image.open(args.image)
-    os.makedirs(args.output_dir, exist_ok=True)
+    image = Image.open(args.image).convert("RGB")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    pipe = build_pipeline(
+        args.model,
+        vbvr_model_path=args.vbvr_model_path,
+        lora_path=args.lora_path,
+        high_noise_lora_path=args.high_noise_lora_path,
+        low_noise_lora_path=args.low_noise_lora_path,
+        lora_alpha=args.lora_alpha,
+    )
 
-    print("=" * 60)
-    print("Custom Step Visualization")
-    print(f"  model:    {args.model}")
-    print(f"  image:    {args.image} ({input_image.width}x{input_image.height})")
-    print(f"  prompt:   {args.prompt[:80]}...")
-    print(f"  frames:   {args.num_frames}")
-    print(f"  steps:    {args.num_inference_steps}")
-    print(f"  vis:      {args.vis_steps}")
-    print("=" * 60)
-
-    if args.model == "wan2.2":
-        pipe = build_wan22_pipeline(args, vram_config)
-    elif args.model == "wan2.1":
-        pipe = build_wan21_pipeline(args, vram_config)
-    else:
-        pipe = build_ltx_pipeline(args, vram_config)
-
-    if args.save_noise_schedule and not is_ltx:
+    if args.save_noise_schedule and args.model != "ltx2.3":
         pipe.scheduler.set_timesteps(args.num_inference_steps, shift=5.0)
-        noise_schedule = [
-            {"step": i, "timestep": round(ts.item(), 4), "sigma": round(sig.item(), 6)}
-            for i, (sig, ts) in enumerate(zip(pipe.scheduler.sigmas, pipe.scheduler.timesteps))
+        schedule = [
+            {
+                "step": index,
+                "timestep": round(timestep.item(), 4),
+                "sigma": round(sigma.item(), 6),
+            }
+            for index, (sigma, timestep) in enumerate(
+                zip(pipe.scheduler.sigmas, pipe.scheduler.timesteps)
+            )
         ]
-        sched_path = os.path.join(args.output_dir, "noise_schedule.json")
-        with open(sched_path, 'w') as f:
-            json.dump(noise_schedule, f, indent=2)
-        print(f"Saved noise schedule: {sched_path}")
+        atomic_write_json(args.output_dir / "noise_schedule.json", {"steps": schedule})
 
-    step_dir = os.path.join(args.output_dir, "steps")
-    callback = make_step_callback(step_dir, fps=args.fps)
+    negative_prompt = args.negative_prompt or default_negative_prompt(args.model)
+    callback = make_step_callback(args.output_dir / "steps", fps=args.fps)
+    output_path = args.output_dir / "generated.mp4"
 
-    neg = args.negative_prompt or (
-        "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，"
-        "静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，"
-        "多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，"
-        "形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，"
-        "背景人很多，倒着走"
-    ) if not is_ltx else (args.negative_prompt or (
-        "blurry, out of focus, overexposed, underexposed, low contrast, "
-        "washed out colors, excessive noise, grainy texture, poor lighting, "
-        "flickering, motion blur, distorted proportions, artifacts"
-    ))
-
-    output_path = os.path.join(args.output_dir, "generated.mp4")
-
-    if is_ltx:
+    if args.model == "ltx2.3":
         from diffsynth.utils.data.media_io_ltx2 import write_video_audio_ltx2
-        video, audio = pipe(
-            prompt=args.prompt, negative_prompt=neg,
-            input_images=[input_image], input_images_indexes=[0],
-            input_images_strength=1.0, num_frames=args.num_frames,
-            seed=args.seed, tiled=True,
-            height=input_image.height, width=input_image.width,
-            num_inference_steps=args.num_inference_steps,
-            step_callback=callback, vis_steps=vis_steps,
-        )
-        write_video_audio_ltx2(video=video, audio=audio, output_path=output_path,
-                               fps=args.fps, audio_sample_rate=pipe.audio_vocoder.output_sampling_rate)
-    else:
-        video = pipe(
-            prompt=args.prompt, negative_prompt=neg,
-            input_image=input_image, num_frames=args.num_frames,
-            seed=args.seed, tiled=True,
-            height=input_image.height, width=input_image.width,
-            num_inference_steps=args.num_inference_steps,
-            step_callback=callback, vis_steps=vis_steps,
-        )
-        save_video(video, output_path, fps=args.fps, quality=5)
 
-    print(f"\nFinal video: {output_path}")
-    print("Done!")
+        video, audio = pipe(
+            prompt=args.prompt,
+            negative_prompt=negative_prompt,
+            input_images=[image],
+            input_images_indexes=[0],
+            input_images_strength=1.0,
+            num_frames=args.num_frames,
+            seed=args.seed,
+            tiled=True,
+            height=image.height,
+            width=image.width,
+            num_inference_steps=args.num_inference_steps,
+            step_callback=callback,
+            vis_steps=visualization_steps,
+        )
+        write_video_audio_ltx2(
+            video=video,
+            audio=audio,
+            output_path=str(output_path),
+            fps=args.fps,
+            audio_sample_rate=pipe.audio_vocoder.output_sampling_rate,
+        )
+    else:
+        from diffsynth.utils.data import save_video
+
+        video = pipe(
+            prompt=args.prompt,
+            negative_prompt=negative_prompt,
+            input_image=image,
+            num_frames=args.num_frames,
+            seed=args.seed,
+            tiled=True,
+            height=image.height,
+            width=image.width,
+            num_inference_steps=args.num_inference_steps,
+            step_callback=callback,
+            vis_steps=visualization_steps,
+            max_denoising_steps=args.max_denoising_steps,
+        )
+        save_video(video, str(output_path), fps=args.fps, quality=5)
+
+    atomic_write_json(
+        args.output_dir / "metadata.json",
+        {
+            "generation": config.to_dict(),
+            "image": str(args.image.resolve()),
+            "prompt": args.prompt,
+            "visualization_steps": args.visualization_steps,
+        },
+    )
+    print(f"Generated video: {output_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -184,8 +184,8 @@ python tools/custom_step_visualization.py \
     --model wan2.2 \
     --image ./my_image.png \
     --prompt "A cat walks across the room" \
-    --output_dir ./output/custom_step \
-    --num_frames 81
+    --output-dir ./output/custom_step \
+    --num-frames 81
 ```
 
 ### 4. Custom Input - Token Visualization
@@ -201,6 +201,13 @@ python tools/custom_token_visualization.py \
     --num_frames 81 \
     --layers 0 10 20 30 39
 ```
+
+### 5. Dataset Workflows
+
+Folder-based custom inputs and distributed Language-Table processing are
+available under `scripts/`. See
+[Custom dataset workflow](docs/workflows/custom-dataset.md) and
+[Language-Table workflow](docs/workflows/language-table.md).
 
 ## Common Options
 

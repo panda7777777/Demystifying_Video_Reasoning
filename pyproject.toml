@@ -4,6 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diffsynth"
+dynamic = ["version"]
 requires-python = ">=3.10.1"
 dependencies = [
     "torch>=2.0.0",
@@ -50,3 +51,6 @@ audio = [
 
 [tool.setuptools]
 include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "diffsynth.version.__version__"}
