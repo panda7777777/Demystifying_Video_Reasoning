@@ -10,6 +10,12 @@ from pathlib import Path
 
 from PIL import Image
 
+from scripts._batch_visualization import (
+    contiguous_ranges,
+    ensure_run_manifest,
+    parse_indices,
+    shard_indices,
+)
 from scripts._visualization import (
     GenerationConfig,
     parse_visualization_steps,
@@ -24,13 +30,16 @@ from scripts.custom.visualize import (
 from scripts.language_table.download import destination_path
 from scripts.language_table.results import evenly_spaced_indices
 from scripts.language_table.visualize import (
-    contiguous_ranges,
-    ensure_run_manifest,
     orchestrate,
-    parse_indices,
     read_episode_count,
     resolve_builder_dir,
-    shard_indices,
+)
+from scripts.rmbench.visualize import (
+    Sample,
+    discover_tasks,
+    load_prompt,
+    parse_tasks,
+    select_samples,
 )
 
 
@@ -225,6 +234,86 @@ class CustomDatasetTests(unittest.TestCase):
         self.assertEqual(resolved["seed"], 9)
         self.assertEqual(resolved["fps"], 12)
         self.assertEqual(resolved["model"], DEFAULTS["model"])
+
+
+class RMBenchWorkflowTests(unittest.TestCase):
+    @staticmethod
+    def make_episode(root: Path, task: str, episode: int, prompt: str = "move") -> None:
+        setting = root / task / "demo_clean"
+        (setting / "video").mkdir(parents=True, exist_ok=True)
+        (setting / "instructions").mkdir(parents=True, exist_ok=True)
+        (setting / "video" / f"episode{episode}.mp4").write_bytes(b"video")
+        (setting / "instructions" / f"episode{episode}.json").write_text(
+            json.dumps({"seen": [prompt], "unseen": [f"{prompt} unseen"]}),
+            encoding="utf-8",
+        )
+
+    def test_discovers_and_numerically_sorts_episodes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_episode(root, "task_b", 10)
+            self.make_episode(root, "task_b", 2)
+            self.make_episode(root, "task_a", 0)
+            tasks = discover_tasks(root)
+            self.assertEqual(list(tasks), ["task_a", "task_b"])
+            self.assertEqual(
+                [sample.episode for sample in tasks["task_b"]],
+                [2, 10],
+            )
+            self.assertEqual(
+                tasks["task_b"][0].sample_id,
+                "task_b__episode_000002",
+            )
+
+    def test_rejects_mismatched_video_and_instruction_sets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_episode(root, "task", 0)
+            (root / "task/demo_clean/instructions/episode0.json").unlink()
+            with self.assertRaisesRegex(ValueError, "missing instructions"):
+                discover_tasks(root)
+
+    def test_selects_tasks_and_episode_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for task in ("alpha", "beta"):
+                for episode in range(4):
+                    self.make_episode(root, task, episode)
+            tasks = discover_tasks(root)
+            selected = select_samples(
+                tasks,
+                task_spec="beta,alpha",
+                episode_spec="1:4:2",
+            )
+            self.assertEqual(
+                [(sample.task, sample.episode) for sample in selected],
+                [("alpha", 1), ("alpha", 3), ("beta", 1), ("beta", 3)],
+            )
+            with self.assertRaisesRegex(ValueError, "Unknown tasks"):
+                parse_tasks("missing", sorted(tasks))
+
+    def test_loads_selected_instruction_and_validates_cardinality(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_episode(root, "task", 0, "do the task")
+            sample = discover_tasks(root)["task"][0]
+            self.assertEqual(load_prompt(sample, "seen"), "do the task")
+            self.assertEqual(load_prompt(sample, "unseen"), "do the task unseen")
+            sample.instruction_path.write_text(
+                '{"seen": [], "unseen": ["ok"]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                load_prompt(sample, "seen")
+
+    def test_sample_assignment_round_trip(self):
+        sample = Sample(
+            "task",
+            7,
+            Path("/data/video/episode7.mp4"),
+            Path("/data/instructions/episode7.json"),
+        )
+        self.assertEqual(Sample.from_dict(sample.to_dict()), sample)
 
 
 class ResultUtilityTests(unittest.TestCase):

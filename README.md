@@ -175,6 +175,23 @@ python tools/token_visualization.py \
     --max_samples 5
 ```
 
+### RMBench Batch Step Visualization
+
+Run step visualization over RMBench tasks and episodes with deterministic
+multi-GPU or multi-node sharding:
+
+```bash
+python scripts/rmbench/visualize.py \
+    --data-dir /path/to/RMBench/data/data \
+    --output-root ./output/step_visualization/rmbench \
+    --tasks cover_blocks,press_button \
+    --episodes 0:10 \
+    --gpus 0,1,2,3
+```
+
+See [the RMBench workflow guide](docs/workflows/rmbench.md) for data layout,
+selection, extraction-only, resume, and multi-node usage.
+
 ### 3. Custom Input - Step Visualization
 
 Run step visualization on a single image + text prompt (no VBVR-Bench data needed):
@@ -204,10 +221,11 @@ python tools/custom_token_visualization.py \
 
 ### 5. Dataset Workflows
 
-Folder-based custom inputs and distributed Language-Table processing are
-available under `scripts/`. See
+Folder-based custom inputs and distributed Language-Table and RMBench
+processing are available under `scripts/`. See
 [Custom dataset workflow](docs/workflows/custom-dataset.md) and
-[Language-Table workflow](docs/workflows/language-table.md).
+[Language-Table workflow](docs/workflows/language-table.md), or the
+[RMBench workflow](docs/workflows/rmbench.md).
 
 ## Common Options
 
