@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -23,15 +24,59 @@ LTX_NEGATIVE_PROMPT = (
     "flickering, motion blur, distorted proportions, artifacts"
 )
 
-SUPPORTED_MODELS = ("wan2.2", "wan2.1", "ltx2.3", "vbvr-wan2.2")
+SUPPORTED_MODEL_FAMILIES = ("wan2.2", "wan2.1", "ltx2.3", "vbvr-wan2.2")
 WAN_MODELS = frozenset({"wan2.2", "wan2.1", "vbvr-wan2.2"})
+HF_REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def validate_model_source(model: str) -> str:
+    """Validate and normalize an absolute directory or Hugging Face repo id."""
+    path = Path(model)
+    if path.is_absolute():
+        if not path.is_dir():
+            raise ValueError(f"Model path is not an existing directory: {model}")
+        return str(path.resolve())
+    if not HF_REPO_ID.fullmatch(model):
+        raise ValueError(
+            "model must be an absolute directory or a Hugging Face repository "
+            "id such as Wan-AI/Wan2.2-I2V-A14B"
+        )
+    return model
+
+
+def model_family(model: str) -> str:
+    """Infer the supported pipeline family from a model source."""
+    name = model.rstrip("/").rsplit("/", 1)[-1].lower()
+    if "vbvr" in name and "wan2.2" in name:
+        return "vbvr-wan2.2"
+    if "wan2.2" in name:
+        return "wan2.2"
+    if "wan2.1" in name:
+        return "wan2.1"
+    if "ltx-2.3" in name or "ltx2.3" in name:
+        return "ltx2.3"
+
+    path = Path(model)
+    if path.is_absolute():
+        if (path / "transformer").is_dir() and (path / "transformer_2").is_dir():
+            return "vbvr-wan2.2"
+        if (path / "high_noise_model").is_dir() and (path / "low_noise_model").is_dir():
+            return "wan2.2"
+        if (path / "transformer.safetensors").is_file():
+            return "ltx2.3"
+        if list(path.glob("diffusion_pytorch_model*.safetensors")):
+            return "wan2.1"
+    raise ValueError(
+        f"Cannot infer a supported model family from {model!r}; supported families: "
+        + ", ".join(SUPPORTED_MODEL_FAMILIES)
+    )
 
 
 @dataclass(frozen=True)
 class GenerationConfig:
     """Serializable generation options shared by command-line workflows."""
 
-    model: str = "wan2.2"
+    model: str = "Wan-AI/Wan2.2-I2V-A14B"
     num_frames: int = 49
     num_inference_steps: int = 30
     max_denoising_steps: int | None = None
@@ -40,8 +85,8 @@ class GenerationConfig:
     negative_prompt: str | None = None
 
     def validate(self) -> None:
-        if self.model not in SUPPORTED_MODELS:
-            raise ValueError(f"Unsupported model: {self.model}")
+        validate_model_source(self.model)
+        family = model_family(self.model)
         if self.num_frames <= 0:
             raise ValueError("num_frames must be positive")
         if self.num_inference_steps <= 0:
@@ -49,7 +94,7 @@ class GenerationConfig:
         if self.fps <= 0:
             raise ValueError("fps must be positive")
         if self.max_denoising_steps is not None:
-            if self.model not in WAN_MODELS:
+            if family not in WAN_MODELS:
                 raise ValueError("max_denoising_steps is supported only for Wan models")
             if not 1 <= self.max_denoising_steps <= self.num_inference_steps:
                 raise ValueError(
@@ -97,7 +142,7 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def default_negative_prompt(model: str) -> str:
-    return LTX_NEGATIVE_PROMPT if model == "ltx2.3" else WAN_NEGATIVE_PROMPT
+    return LTX_NEGATIVE_PROMPT if model_family(model) == "ltx2.3" else WAN_NEGATIVE_PROMPT
 
 
 def make_step_callback(output_dir: Path, fps: int = 16) -> Callable:
@@ -127,10 +172,88 @@ def _vram_config(torch: Any) -> dict[str, Any]:
     }
 
 
+def _load_wan_adapter(pipe: Any, dit: Any, path: str, alpha: float) -> None:
+    """Load a regular LoRA or auto-detected Skip-LoRA checkpoint."""
+    import re
+
+    import torch
+
+    from diffsynth.core import load_state_dict
+
+    state_dict = load_state_dict(
+        path, torch_dtype=getattr(pipe, "torch_dtype", torch.bfloat16), device="cpu"
+    )
+    if not any(key.endswith(".skip_proj.weight") for key in state_dict):
+        pipe.load_lora(dit, state_dict=state_dict, alpha=alpha)
+        return
+
+    from diffsynth.core.vram.layers import AutoWrappedNonRecurseModule
+    from diffsynth.diffusion.skip_lora import (
+        SkipLoRAConfig,
+        SkipLoRALinear,
+        attach_skip_lora,
+    )
+
+    lora_a = next(
+        (value for key, value in state_dict.items() if key.endswith(".lora_A.weight")),
+        None,
+    )
+    if lora_a is None:
+        raise ValueError(f"Skip-LoRA checkpoint has no lora_A weights: {path}")
+    rank = lora_a.shape[0]
+    config = SkipLoRAConfig(
+        rank=rank,
+        lora_alpha=rank * alpha,
+        combine_mode="linear",
+        carry_mode="accumulate",
+        normalize_skip=False,
+        detach_across_blocks=True,
+        detach_within_block=True,
+    )
+    attach_skip_lora(dit, config)
+
+    # Skip-LoRA parameters stay resident while the frozen block weights are
+    # managed by CPU offload.
+    target_device = getattr(pipe, "device", "cuda")
+    target_dtype = getattr(pipe, "torch_dtype", torch.bfloat16)
+    for module in dit.modules():
+        if isinstance(module, SkipLoRALinear):
+            for name, parameter in module.named_parameters(recurse=True):
+                if not name.startswith("base."):
+                    parameter.data = parameter.data.to(
+                        device=target_device, dtype=target_dtype
+                    )
+
+    if (
+        len(dit.blocks)
+        and isinstance(dit.blocks[0], AutoWrappedNonRecurseModule)
+    ):
+        pattern = re.compile(r"^(blocks\.\d+)\.(?!module\.)(.+)$")
+        state_dict = {
+            (f"{match.group(1)}.module.{match.group(2)}" if (match := pattern.match(key)) else key): value
+            for key, value in state_dict.items()
+        }
+
+    result = dit.load_state_dict(state_dict, strict=False)
+    adapter_markers = ("lora_A.weight", "lora_B.weight", "skip_proj.weight")
+    missing = [
+        key for key in result.missing_keys if any(marker in key for marker in adapter_markers)
+    ]
+    if result.unexpected_keys or missing:
+        raise RuntimeError(
+            "Skip-LoRA checkpoint does not match the Wan DiT: "
+            f"unexpected={result.unexpected_keys[:5]}, missing={missing[:5]}"
+        )
+    print(
+        f"[Skip-LoRA] loaded {len(state_dict)} tensors from {path} "
+        f"(rank={rank}, scale={alpha}, combine=linear, carry=accumulate)",
+        flush=True,
+    )
+
+
 def build_pipeline(
     model: str,
     *,
-    vbvr_model_path: Path | None = None,
     lora_path: str | None = None,
     high_noise_lora_path: str | None = None,
     low_noise_lora_path: str | None = None,
@@ -141,124 +264,70 @@ def build_pipeline(
 
     from diffsynth.pipelines.wan_video import ModelConfig, WanVideoPipeline
 
+    model = validate_model_source(model)
+    family = model_family(model)
     config = _vram_config(torch)
-    if model == "wan2.2":
-        pipe = WanVideoPipeline.from_pretrained(
-            torch_dtype=torch.bfloat16,
-            device="cuda",
-            redirect_common_files=False,
-            model_configs=[
-                ModelConfig(
-                    model_id="Wan-AI/Wan2.2-I2V-A14B",
-                    origin_file_pattern=(
-                        "high_noise_model/diffusion_pytorch_model*.safetensors"
-                    ),
-                    **config,
-                ),
-                ModelConfig(
-                    model_id="Wan-AI/Wan2.2-I2V-A14B",
-                    origin_file_pattern=(
-                        "low_noise_model/diffusion_pytorch_model*.safetensors"
-                    ),
-                    **config,
-                ),
-                ModelConfig(
-                    model_id="Wan-AI/Wan2.2-I2V-A14B",
-                    origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
-                    **config,
-                ),
-                ModelConfig(
-                    model_id="Wan-AI/Wan2.2-I2V-A14B",
-                    origin_file_pattern="Wan2.1_VAE.pth",
-                    **config,
-                ),
-            ],
-            tokenizer_config=ModelConfig(
-                model_id="Wan-AI/Wan2.2-I2V-A14B",
-                origin_file_pattern="google/umt5-xxl/",
-            ),
-        )
-    elif model == "vbvr-wan2.2":
-        if vbvr_model_path is None:
-            env_path = os.environ.get("VBVR_MODEL_PATH")
-            vbvr_model_path = Path(env_path) if env_path else None
-        if vbvr_model_path is None:
-            raise ValueError(
-                "VBVR-Wan2.2 requires --vbvr-model-path or VBVR_MODEL_PATH"
-            )
 
-        def expert(subdirectory: str) -> ModelConfig:
-            files = sorted(
-                str(path)
-                for path in (vbvr_model_path / subdirectory).glob(
-                    "diffusion_pytorch_model*.safetensors"
-                )
-            )
-            if not files:
-                raise FileNotFoundError(
-                    f"No diffusion safetensors found in "
-                    f"{vbvr_model_path / subdirectory}"
-                )
-            return ModelConfig(path=files, **config)
+    def source_config(
+        pattern: str | None = None,
+        *,
+        source: str = model,
+        with_vram: bool = True,
+    ) -> ModelConfig:
+        options = config if with_vram else {}
+        path = Path(source)
+        if path.is_absolute():
+            if pattern is None:
+                matched: str | list[str] = str(path)
+            else:
+                files = sorted(str(item) for item in path.glob(pattern))
+                if not files:
+                    raise FileNotFoundError(f"No model files matching {path / pattern}")
+                matched = files
+            return ModelConfig(path=matched, **options)
+        return ModelConfig(model_id=source, origin_file_pattern=pattern, **options)
 
+    if family == "wan2.2":
         pipe = WanVideoPipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
             device="cuda",
             redirect_common_files=False,
             model_configs=[
-                expert("transformer"),
-                expert("transformer_2"),
-                ModelConfig(
-                    model_id="Wan-AI/Wan2.2-I2V-A14B",
-                    origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
-                    **config,
-                ),
-                ModelConfig(
-                    model_id="Wan-AI/Wan2.2-I2V-A14B",
-                    origin_file_pattern="Wan2.1_VAE.pth",
-                    **config,
-                ),
+                source_config("high_noise_model/diffusion_pytorch_model*.safetensors"),
+                source_config("low_noise_model/diffusion_pytorch_model*.safetensors"),
+                source_config("models_t5_umt5-xxl-enc-bf16.pth"),
+                source_config("Wan2.1_VAE.pth"),
             ],
-            tokenizer_config=ModelConfig(
-                model_id="Wan-AI/Wan2.2-I2V-A14B",
-                origin_file_pattern="google/umt5-xxl/",
-            ),
+            tokenizer_config=source_config("google/umt5-xxl/", with_vram=False),
         )
-    elif model == "wan2.1":
+    elif family == "vbvr-wan2.2":
+        base_source = "Wan-AI/Wan2.2-I2V-A14B"
         pipe = WanVideoPipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
             device="cuda",
             redirect_common_files=False,
             model_configs=[
-                ModelConfig(
-                    model_id="Wan-AI/Wan2.1-I2V-14B-720P",
-                    origin_file_pattern="diffusion_pytorch_model*.safetensors",
-                    **config,
-                ),
-                ModelConfig(
-                    model_id="Wan-AI/Wan2.1-I2V-14B-720P",
-                    origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
-                    **config,
-                ),
-                ModelConfig(
-                    model_id="Wan-AI/Wan2.1-I2V-14B-720P",
-                    origin_file_pattern="Wan2.1_VAE.pth",
-                    **config,
-                ),
-                ModelConfig(
-                    model_id="Wan-AI/Wan2.1-I2V-14B-720P",
-                    origin_file_pattern=(
-                        "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
-                    ),
-                    **config,
-                ),
+                source_config("transformer/diffusion_pytorch_model*.safetensors"),
+                source_config("transformer_2/diffusion_pytorch_model*.safetensors"),
+                source_config("models_t5_umt5-xxl-enc-bf16.pth", source=base_source),
+                source_config("Wan2.1_VAE.pth", source=base_source),
             ],
-            tokenizer_config=ModelConfig(
-                model_id="Wan-AI/Wan2.1-I2V-14B-720P",
-                origin_file_pattern="google/umt5-xxl/",
-            ),
+            tokenizer_config=source_config("google/umt5-xxl/", source=base_source, with_vram=False),
         )
-    elif model == "ltx2.3":
+    elif family == "wan2.1":
+        pipe = WanVideoPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device="cuda",
+            redirect_common_files=False,
+            model_configs=[
+                source_config("diffusion_pytorch_model*.safetensors"),
+                source_config("models_t5_umt5-xxl-enc-bf16.pth"),
+                source_config("Wan2.1_VAE.pth"),
+                source_config("models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
+            ],
+            tokenizer_config=source_config("google/umt5-xxl/", with_vram=False),
+        )
+    elif family == "ltx2.3":
         from diffsynth.pipelines.ltx2_audio_video import (
             LTX2AudioVideoPipeline,
         )
@@ -273,11 +342,7 @@ def build_pipeline(
                     **config,
                 ),
                 *[
-                    ModelConfig(
-                        model_id="DiffSynth-Studio/LTX-2.3-Repackage",
-                        origin_file_pattern=pattern,
-                        **config,
-                    )
+                    source_config(pattern)
                     for pattern in (
                         "transformer.safetensors",
                         "text_encoder_post_modules.safetensors",
@@ -295,11 +360,11 @@ def build_pipeline(
     else:
         raise ValueError(f"Unsupported model: {model}")
 
-    if model in {"wan2.2", "vbvr-wan2.2"}:
+    if family in {"wan2.2", "vbvr-wan2.2"}:
         if high_noise_lora_path:
-            pipe.load_lora(pipe.dit, high_noise_lora_path, alpha=lora_alpha)
+            _load_wan_adapter(pipe, pipe.dit, high_noise_lora_path, lora_alpha)
         if low_noise_lora_path:
-            pipe.load_lora(pipe.dit2, low_noise_lora_path, alpha=lora_alpha)
+            _load_wan_adapter(pipe, pipe.dit2, low_noise_lora_path, lora_alpha)
     elif lora_path:
         pipe.load_lora(pipe.dit, lora_path, alpha=lora_alpha)
     return pipe

@@ -48,6 +48,11 @@ audio = [
     "torchaudio",
     "torchcodec"
 ]
+language-table = [
+    "tensorflow-cpu>=2.12",
+    "tensorflow-datasets>=4.9",
+    "tqdm>=4.64",
+]
 
 [tool.setuptools]
 include-package-data = true

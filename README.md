@@ -175,22 +175,24 @@ python tools/token_visualization.py \
     --max_samples 5
 ```
 
-### RMBench Batch Step Visualization
+### Unified Dataset Inference
 
-Run step visualization over RMBench tasks and episodes with deterministic
-multi-GPU or multi-node sharding:
+All custom, RMBench, and Language-Table runs now share one entry point and one
+result format. The output argument names only a parent directory; a run folder
+such as `20260802_1530_wan22_rmbench` is created automatically.
 
 ```bash
-python scripts/rmbench/visualize.py \
+python scripts/run.py \
+    --model wan2.2 \
+    --dataset rmbench \
     --data-dir /path/to/RMBench/data/data \
-    --output-root ./output/step_visualization/rmbench \
-    --tasks cover_blocks,press_button \
-    --episodes 0:10 \
+    --output-dir ./output \
+    --selection 'cover_blocks,press_button:0:10' \
     --gpus 0,1,2,3
 ```
 
-See [the RMBench workflow guide](docs/workflows/rmbench.md) for data layout,
-selection, extraction-only, resume, and multi-node usage.
+For the editable launcher, set the important values at the top of
+`scripts/launch.sh`, then run `bash scripts/launch.sh`.
 
 ### 3. Custom Input - Step Visualization
 

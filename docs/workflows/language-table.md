@@ -16,18 +16,21 @@ python scripts/language_table/download.py \
   --out-dir ./data/language-table
 ```
 
-TFRecord extraction additionally requires `tensorflow-datasets` and Pillow. Use
-`--tfds-python` to point at a separate environment containing those packages.
+Install the Language-Table TFRecord dependencies in the active environment:
+
+```bash
+python -m pip install -e '.[language-table]'
+```
 
 ## Batch visualization
 
 ```bash
-python scripts/language_table/visualize.py \
+python scripts/run.py --dataset language-table \
   --data-dir ./data/language-table/0.0.1 \
-  --output-root ./output/step_visualization/language_table \
-  --tfds-python /path/to/tfds/python \
+  --output-dir ./output \
   --gpus 0,1,2,3 \
-  --indices 0:100 \
+  --selection 0:100 \
+  --split train \
   --max-denoising-steps 10
 ```
 
@@ -38,19 +41,13 @@ Completed episodes are resumed only when their metadata matches the current
 For a scheduler or manual multi-node launch:
 
 ```bash
-DATA_DIR=/shared/language-table/0.0.1 \
-OUTPUT_ROOT=/shared/results \
-NUM_NODES=2 NODE_RANK=0 GPUS=0,1,2,3 \
-bash scripts/language_table/launch.sh --indices 0:1000
+Edit the configuration block in `scripts/launch.sh`, then run it on every node.
+Use the same automatically printed `--run-name` on all nodes when launches may
+cross a minute boundary.
 ```
 
 ## Results
 
-```bash
-python scripts/language_table/results.py --root ./output/run find-prompt "prompt"
-python scripts/language_table/results.py --root ./output/run sample 10 --seed 1
-python scripts/language_table/results.py --root ./output/run render --workers 8
-```
-
-Rendered frames and montages are written under `analysis/{sample_id}/`, leaving
-the generated episode artifacts unchanged.
+No post-processing command is required. Every sample contains its initial
+frame and prompt, generated video, per-step videos, all per-step frames, and a
+paper-ready `output/overview.png`.

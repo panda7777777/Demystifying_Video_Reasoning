@@ -26,19 +26,17 @@ frame and the single `seen` instruction by default; pass
 Preview a selection without writing files:
 
 ```bash
-python scripts/rmbench/visualize.py \
+python scripts/run.py --dataset rmbench \
   --data-dir /path/to/RMBench/data/data \
-  --output-root ./output/step_visualization/rmbench \
-  --tasks cover_blocks,press_button \
-  --episodes 0:10 \
+  --output-dir ./output \
+  --selection 'cover_blocks,press_button:0:10' \
   --gpus 0,1,2,3 \
   --dry-run
 ```
 
-Remove `--dry-run` to extract inputs and run inference. `--tasks` accepts `all`
-or comma-separated task names. `--episodes` accepts `all`, individual indices,
-and Python-style slices such as `0:20:2,49`; the same selection is applied to
-each task.
+Remove `--dry-run` to extract inputs and run inference. The part before the
+first colon selects comma-separated tasks and the remainder is a Python-style
+episode-position slice.
 
 Wan models save the first 10 denoising steps by default. Override this with
 `--max-denoising-steps`. LTX runs all configured steps unless a Wan model is
@@ -52,7 +50,7 @@ Use a new output directory or `--overwrite` for changed parameters.
 
 ## Multiple nodes
 
-`scripts/rmbench/launch.sh` exposes all dataset, model, generation, GPU, node,
+`scripts/launch.sh` exposes all dataset, model, generation, GPU, node,
 interpreter, and run-mode options in the user configuration section at the top
 of the file. Edit that section explicitly before launching. The remainder of
 the script validates the values, changes to the repository root so relative
@@ -69,8 +67,7 @@ NUM_NODES="2"
 NODE_RANK="0"  # Change to "1" on the second node.
 ```
 
-Then run `bash scripts/rmbench/launch.sh`. Nodes do not communicate, but must
+Then run `bash scripts/launch.sh`. Nodes do not communicate, but must
 use the same dataset and output paths. Assignments and worker logs are stored
 under `runtime/`. Normalized inputs use IDs such as
-`cover_blocks__episode_000000`; completed generations use the same IDs under
-`episodes/`.
+`cover_blocks__episode_000000` under `samples/`.
