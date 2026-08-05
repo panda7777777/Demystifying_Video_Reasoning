@@ -41,3 +41,6 @@ venv/
 # Run scripts
 show_res.sh
 scripts/launch.sh
+
+# Vibe coding
+chat.txt
