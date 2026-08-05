@@ -37,3 +37,7 @@ venv/
 *.log
 /build/
 /dist/
+
+# Run scripts
+show_res.sh
+scripts/launch.sh

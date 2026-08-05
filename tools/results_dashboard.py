@@ -7,6 +7,7 @@ import argparse
 import json
 import mimetypes
 import re
+import threading
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RESULT_DIR = REPO_ROOT / "output" / "20260804_1513_wan22_ltable"
 RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)$")
 STEP_RE = re.compile(r"step_(\d+)$")
+ANNOTATION_FILENAME = "annotation.json"
+COS_TYPES = (
+    "Unknown",
+    "Multi-Path",
+    "Superposition",
+    "Memory",
+    "Self-correction",
+    "Perception Before Action",
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +49,7 @@ class ResultIndex:
 
         run_data = self._read_run_data()
         ordered_ids = self._ordered_sample_ids(samples_dir, run_data)
+        self.all_samples = [self._load_sample(samples_dir, task_id) for task_id in ordered_ids]
         if data_indices is not None:
             ordered_ids = self._select_sample_ids(ordered_ids, data_indices)
         self.samples = [self._load_sample(samples_dir, task_id) for task_id in ordered_ids]
@@ -154,8 +165,48 @@ class ResultIndex:
             "task_id": sample.task_id,
             "prompt": prompt,
             "initial_frame": self.media_url(frame) if frame.is_file() else None,
+            "cos_type": self._read_annotation(sample),
             "step_videos": step_videos,
         }
+
+    @staticmethod
+    def _read_annotation(sample: Sample) -> str | None:
+        try:
+            data = json.loads((sample.path / ANNOTATION_FILENAME).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "Unknown"
+        value = data.get("cos_type") if isinstance(data, dict) else None
+        return value if value in COS_TYPES else "Unknown"
+
+    def save_annotation(self, task_id: str, cos_type: str | None) -> None:
+        cos_type = "Unknown" if cos_type is None else cos_type
+        if cos_type not in COS_TYPES:
+            raise ValueError(f"无效的 CoS Type: {cos_type}")
+        sample = self._sample_by_id(task_id)
+        annotation_path = sample.path / ANNOTATION_FILENAME
+        temporary_path = sample.path / f".{ANNOTATION_FILENAME}.tmp"
+        temporary_path.write_text(
+            json.dumps({"cos_type": cos_type}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(annotation_path)
+
+    def clear_annotations(self) -> int:
+        cleared = 0
+        for sample in self.all_samples:
+            annotation_path = sample.path / ANNOTATION_FILENAME
+            try:
+                annotation_path.unlink()
+                cleared += 1
+            except FileNotFoundError:
+                pass
+        return cleared
+
+    def _sample_by_id(self, task_id: str) -> Sample:
+        for sample in self.all_samples:
+            if sample.task_id == task_id:
+                return sample
+        raise ValueError(f"样本不存在: {task_id}")
 
     def media_url(self, path: Path) -> str:
         relative = path.resolve().relative_to(self.root).as_posix()
@@ -181,6 +232,7 @@ class DashboardServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], index: ResultIndex, page_size: int):
         self.index = index
         self.default_page_size = page_size
+        self.annotation_lock = threading.Lock()
         super().__init__(address, DashboardHandler)
 
 
@@ -199,6 +251,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "result_dir": str(self.server.index.root),
                     "total": len(self.server.index.samples),
                     "steps": self.server.index.step_names,
+                    "cos_types": list(COS_TYPES),
                     "default_page_size": self.server.default_page_size,
                 }
             )
@@ -217,6 +270,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_media(parsed.path[len("/media/") :], head_only=True)
             return
         self.send_error(HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:  # noqa: N802
+        if urlparse(self.path).path != "/api/annotation":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 4096:
+                raise ValueError("请求体大小无效")
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict) or not isinstance(payload.get("task_id"), str):
+                raise ValueError("请求必须包含 task_id")
+            cos_type = payload.get("cos_type")
+            if cos_type is not None and not isinstance(cos_type, str):
+                raise ValueError("cos_type 必须是字符串或 null")
+            with self.server.annotation_lock:
+                self.server.index.save_annotation(payload["task_id"], cos_type)
+        except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json({"ok": True, "cos_type": cos_type})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        if urlparse(self.path).path != "/api/annotations":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            with self.server.annotation_lock:
+                cleared = self.server.index.clear_annotations()
+        except OSError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        self._send_json({"ok": True, "cleared": cleared})
 
     def _serve_samples(self, query: str) -> None:
         values = parse_qs(query)
@@ -332,8 +418,8 @@ INDEX_HTML = r'''<!doctype html>
     .eyebrow { color:var(--accent); font-size:14px; font-weight:900; letter-spacing:.16em; text-transform:uppercase; margin-bottom:10px; }
     #run-info { max-width:650px; color:var(--muted); font-size:16px; font-weight:750; text-align:right; overflow-wrap:anywhere; }
     .toolbar { margin:0 24px 16px; padding:14px 18px; background:rgba(255,255,255,.82); border:1px solid rgba(255,255,255,.95); border-radius:18px; box-shadow:0 12px 35px rgba(25,43,68,.1); display:flex; align-items:center; justify-content:space-between; gap:18px; backdrop-filter:blur(16px); }
-    .pager,.page-size { display:flex; align-items:center; gap:10px; font-weight:850; font-size:17px; }
-    button,input { font:inherit; font-weight:850; border:2px solid var(--ink); background:#fff; color:var(--ink); border-radius:11px; min-height:44px; }
+    .pager,.page-size,.annotation-controls { display:flex; align-items:center; gap:10px; font-weight:850; font-size:17px; }
+    button,input,select { font:inherit; font-weight:850; border:2px solid var(--ink); background:#fff; color:var(--ink); border-radius:11px; min-height:44px; }
     button { padding:8px 16px; cursor:pointer; box-shadow:3px 3px 0 var(--ink); transition:transform .12s,box-shadow .12s; }
     button:hover:not(:disabled) { transform:translate(-1px,-1px); box-shadow:5px 5px 0 var(--ink); }
     button:disabled { opacity:.35; cursor:not-allowed; box-shadow:none; }
@@ -354,6 +440,13 @@ INDEX_HTML = r'''<!doctype html>
     td.id,td.prompt,td.frame { background:#fffdf7; }
     td.id { color:var(--blue); font-size:22px; font-weight:950; font-variant-numeric:tabular-nums; }
     td.prompt { font-size:20px; line-height:1.35; font-weight:900; overflow-wrap:anywhere; }
+    th.annotation,td.annotation { width:250px; min-width:250px; }
+    td.annotation { font-size:18px; font-weight:900; text-align:center; }
+    .annotation-value { display:inline-block; padding:9px 12px; border-radius:10px; background:#e7edff; color:#284aa7; }
+    .annotation-value.unset { background:#eeeae1; color:var(--muted); }
+    .annotation-select { width:100%; padding:8px 10px; }
+    .annotation-select.saving { opacity:.55; }
+    .annotation-error { color:#a62f25; font-size:13px; margin-top:7px; }
     th.step,td.step { width:310px; min-width:310px; }
     img,video { display:block; width:100%; aspect-ratio:20/11; object-fit:cover; border-radius:11px; background:#101722; }
     video { box-shadow:inset 0 0 0 1px rgba(255,255,255,.12); }
@@ -378,19 +471,32 @@ INDEX_HTML = r'''<!doctype html>
     <div class="keys"><kbd>A</kbd> / <kbd>←</kbd> 上一页　<kbd>D</kbd> / <kbd>→</kbd> 下一页</div>
     <label class="page-size">每页 <input id="page-size" type="number" min="1" max="50" step="1"> 条</label>
   </section>
+  <section class="toolbar">
+    <div class="annotation-controls">
+      <button id="toggle-mode" type="button">进入标注模式</button>
+      <button id="clear-annotations" type="button">清空所有标注</button>
+      <button id="toggle-annotations" type="button">隐藏标注</button>
+    </div>
+    <div class="keys" id="mode-hint">当前为查看模式</div>
+  </section>
   <main class="table-shell" id="shell"><div class="empty">正在加载可视化结果…</div></main>
   <script>
-    const state={page:1,pageSize:5,totalPages:1,loading:false};
-    const shell=document.querySelector('#shell'), prev=document.querySelector('#prev'), next=document.querySelector('#next'), pageInput=document.querySelector('#page-number'), totalPagesLabel=document.querySelector('#total-pages'), sizeInput=document.querySelector('#page-size');
+    const state={page:1,pageSize:5,totalPages:1,loading:false,annotationMode:false,annotationsHidden:false,cosTypes:[],data:null};
+    const shell=document.querySelector('#shell'), prev=document.querySelector('#prev'), next=document.querySelector('#next'), pageInput=document.querySelector('#page-number'), totalPagesLabel=document.querySelector('#total-pages'), sizeInput=document.querySelector('#page-size'), modeButton=document.querySelector('#toggle-mode'), clearButton=document.querySelector('#clear-annotations'), annotationsButton=document.querySelector('#toggle-annotations'), modeHint=document.querySelector('#mode-hint');
     const missing=label=>{const d=document.createElement('div');d.className='missing';d.textContent=label;return d};
     function mediaCell(kind,url,label){const td=document.createElement('td');td.className=kind==='video'?'step':'frame';if(!url){td.append(missing('暂无'+label));return td}const el=document.createElement(kind);el.src=url;el.preload='metadata';if(kind==='video'){el.autoplay=true;el.muted=true;el.loop=true;el.playsInline=true;el.controls=true;}else{el.alt=label;el.loading='lazy';}el.addEventListener('error',()=>el.replaceWith(missing(label+'加载失败')));td.append(el);return td}
-    function render(data){const table=document.createElement('table'),head=document.createElement('thead'),hr=document.createElement('tr');[['任务 ID','id'],['提示词','prompt'],['初始帧','frame']].forEach(([text,cls])=>{const th=document.createElement('th');th.className=cls;th.textContent=text;hr.append(th)});data.steps.forEach(step=>{const th=document.createElement('th');th.className='step';th.textContent='Step '+Number(step.slice(5));hr.append(th)});head.append(hr);table.append(head);const body=document.createElement('tbody');data.items.forEach(item=>{const tr=document.createElement('tr'),id=document.createElement('td'),prompt=document.createElement('td');id.className='id';id.textContent=item.task_id;prompt.className='prompt';prompt.textContent=item.prompt||'暂无提示词';tr.append(id,prompt,mediaCell('img',item.initial_frame,'初始帧'));data.steps.forEach(step=>tr.append(mediaCell('video',item.step_videos[step],step)));body.append(tr)});table.append(body);shell.replaceChildren(data.items.length?table:Object.assign(document.createElement('div'),{className:'empty',textContent:'没有可展示的样本'}));document.querySelectorAll('video').forEach(v=>v.play().catch(()=>{}));}
+    async function saveAnnotation(item,select,cell){select.disabled=true;select.classList.add('saving');cell.querySelector('.annotation-error')?.remove();try{const cosType=select.value||null,response=await fetch('/api/annotation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_id:item.task_id,cos_type:cosType})}),data=await response.json();if(!response.ok)throw new Error(data.error||'保存失败');item.cos_type=cosType;}catch(error){select.value=item.cos_type||'';const message=document.createElement('div');message.className='annotation-error';message.textContent='保存失败：'+error.message;cell.append(message);}finally{select.disabled=false;select.classList.remove('saving')}}
+    function annotationCell(item){const td=document.createElement('td');td.className='annotation';if(state.annotationMode){const select=document.createElement('select');select.className='annotation-select';select.setAttribute('aria-label',`${item.task_id} 的 CoS Type`);state.cosTypes.forEach(label=>{const option=document.createElement('option');option.value=label;option.textContent=label;option.selected=item.cos_type===label;select.append(option)});select.addEventListener('change',()=>saveAnnotation(item,select,td));td.append(select);}else{const value=document.createElement('span');value.className='annotation-value';value.textContent=item.cos_type;td.append(value)}return td}
+    function render(data){state.data=data;const table=document.createElement('table'),head=document.createElement('thead'),hr=document.createElement('tr');[['任务 ID','id'],['提示词','prompt'],['初始帧','frame']].forEach(([text,cls])=>{const th=document.createElement('th');th.className=cls;th.textContent=text;hr.append(th)});if(!state.annotationsHidden){const th=document.createElement('th');th.className='annotation';th.textContent='CoS Type';hr.append(th)}data.steps.forEach(step=>{const th=document.createElement('th');th.className='step';th.textContent='Step '+Number(step.slice(5));hr.append(th)});head.append(hr);table.append(head);const body=document.createElement('tbody');data.items.forEach(item=>{const tr=document.createElement('tr'),id=document.createElement('td'),prompt=document.createElement('td');id.className='id';id.textContent=item.task_id;prompt.className='prompt';prompt.textContent=item.prompt||'暂无提示词';tr.append(id,prompt,mediaCell('img',item.initial_frame,'初始帧'));if(!state.annotationsHidden)tr.append(annotationCell(item));data.steps.forEach(step=>tr.append(mediaCell('video',item.step_videos[step],step)));body.append(tr)});table.append(body);shell.replaceChildren(data.items.length?table:Object.assign(document.createElement('div'),{className:'empty',textContent:'没有可展示的样本'}));document.querySelectorAll('video').forEach(v=>v.play().catch(()=>{}));}
     async function load(page=state.page){if(state.loading)return;state.loading=true;shell.classList.add('loading');try{const response=await fetch(`/api/samples?page=${page}&page_size=${state.pageSize}`);const data=await response.json();if(!response.ok)throw new Error(data.error||'请求失败');state.page=data.page;state.totalPages=data.total_pages;render(data);pageInput.value=data.page;pageInput.max=data.total_pages;totalPagesLabel.textContent=`${data.total_pages} · 共 ${data.total} 条`;prev.disabled=data.page<=1;next.disabled=data.page>=data.total_pages;history.replaceState(null,'',`#page=${data.page}`);}catch(error){shell.innerHTML=`<div class="error"></div>`;shell.firstChild.textContent='加载失败：'+error.message;}finally{state.loading=false;shell.classList.remove('loading')}}
     function changePage(delta){const target=Math.max(1,Math.min(state.totalPages,state.page+delta));if(target!==state.page)load(target)}
     function jumpToPage(){const value=Number(pageInput.value);if(Number.isInteger(value)&&value>=1){load(Math.min(value,state.totalPages))}else pageInput.value=state.page}
     prev.addEventListener('click',()=>changePage(-1));next.addEventListener('click',()=>changePage(1));pageInput.addEventListener('change',jumpToPage);pageInput.addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();pageInput.blur()}});sizeInput.addEventListener('change',()=>{const value=Number(sizeInput.value);if(Number.isInteger(value)&&value>=1&&value<=50){state.pageSize=value;load(1)}else sizeInput.value=state.pageSize});
+    modeButton.addEventListener('click',()=>{state.annotationMode=!state.annotationMode;modeButton.textContent=state.annotationMode?'返回查看模式':'进入标注模式';modeHint.textContent=state.annotationMode?'当前为标注模式，选择后自动保存':'当前为查看模式';if(state.data)render(state.data)});
+    annotationsButton.addEventListener('click',()=>{state.annotationsHidden=!state.annotationsHidden;annotationsButton.textContent=state.annotationsHidden?'显示标注':'隐藏标注';if(state.data)render(state.data)});
+    clearButton.addEventListener('click',async()=>{if(!confirm('确定删除该结果目录下所有样本的 annotation.json 吗？此操作不可撤销。'))return;clearButton.disabled=true;try{const response=await fetch('/api/annotations',{method:'DELETE'}),data=await response.json();if(!response.ok)throw new Error(data.error||'清空失败');await load(state.page);alert(`已清空 ${data.cleared} 个标注文件`);}catch(error){alert('清空标注失败：'+error.message)}finally{clearButton.disabled=false}});
     document.addEventListener('keydown',event=>{if(event.altKey||event.ctrlKey||event.metaKey||event.shiftKey)return;const tag=event.target.tagName;if(['INPUT','TEXTAREA','SELECT','BUTTON','VIDEO'].includes(tag)||event.target.isContentEditable)return;if(event.key==='a'||event.key==='A'||event.key==='ArrowLeft'){event.preventDefault();changePage(-1)}if(event.key==='d'||event.key==='D'||event.key==='ArrowRight'){event.preventDefault();changePage(1)}});
-    (async()=>{try{const manifest=await fetch('/api/manifest').then(r=>r.json());state.pageSize=manifest.default_page_size;sizeInput.value=state.pageSize;document.querySelector('#run-info').textContent=`${manifest.run_name} · ${manifest.total} 条样本 · ${manifest.steps.length} 个 Step`;const requested=Number(new URLSearchParams(location.hash.slice(1)).get('page'));load(Number.isInteger(requested)&&requested>0?requested:1)}catch(error){shell.innerHTML='<div class="error">无法连接到看板服务</div>'}})();
+    (async()=>{try{const manifest=await fetch('/api/manifest').then(r=>r.json());state.pageSize=manifest.default_page_size;state.cosTypes=manifest.cos_types;sizeInput.value=state.pageSize;document.querySelector('#run-info').textContent=`${manifest.run_name} · ${manifest.total} 条样本 · ${manifest.steps.length} 个 Step`;const requested=Number(new URLSearchParams(location.hash.slice(1)).get('page'));load(Number.isInteger(requested)&&requested>0?requested:1)}catch(error){shell.innerHTML='<div class="error">无法连接到看板服务</div>'}})();
   </script>
 </body>
 </html>'''

@@ -12,13 +12,13 @@ export LD_LIBRARY_PATH="/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PA
 # Required choices. MODEL must be an absolute local directory or a Hugging Face
 # repository id (namespace/repository).
 MODEL="/mnt/umm/shared_model/Wan2.2-I2V-A14B"
-DATASET="language-table"               # custom | rmbench | language-table
-DATA_DIR="/mnt/umm/users/zuojing/data/language-table/0.0.1"
+DATASET="rmbench"               # custom | rmbench | language-table
+DATA_DIR="/mnt/umm/users/zuojing/code/RMBench/data/data"
 OUTPUT_DIR="./output"          # A timestamped run folder is created inside.
 RESUME_DIR=""                   # Existing run folder; empty starts a new run.
 
 # Dataset and parallelism.
-SELECTION=":1000"
+SELECTION="all"
 SPLIT=""                         # Empty: Language-Table=train, RMBench=seen.
 NUM_NODES="1"
 NODE_RANK="${NODE_RANK:-0}"

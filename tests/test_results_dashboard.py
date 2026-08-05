@@ -78,6 +78,34 @@ class ResultDashboardTest(unittest.TestCase):
             with self.subTest(indices=indices), self.assertRaises(ValueError):
                 ResultIndex(self.root, data_indices=indices)
 
+    def test_annotation_round_trip_and_null_becomes_unknown(self):
+        self.index.save_annotation("000001", "Multi-Path")
+        annotation_path = self.root / "samples" / "000001" / "annotation.json"
+        self.assertEqual(json.loads(annotation_path.read_text())["cos_type"], "Multi-Path")
+        item = self.index.page(1, 2)["items"][1]
+        self.assertEqual(item["cos_type"], "Multi-Path")
+
+        self.index.save_annotation("000001", None)
+        self.assertEqual(json.loads(annotation_path.read_text())["cos_type"], "Unknown")
+        self.assertEqual(self.index.page(1, 2)["items"][1]["cos_type"], "Unknown")
+
+    def test_missing_annotation_is_unknown(self):
+        self.assertEqual(self.index.page(1, 2)["items"][0]["cos_type"], "Unknown")
+
+    def test_annotation_rejects_invalid_type_and_unknown_sample(self):
+        with self.assertRaises(ValueError):
+            self.index.save_annotation("000001", "Other")
+        with self.assertRaises(ValueError):
+            self.index.save_annotation("missing", "Unknown")
+
+    def test_clear_annotations_includes_samples_outside_selection(self):
+        selected = ResultIndex(self.root, data_indices=[0])
+        self.index.save_annotation("000001", "Memory")
+        self.index.save_annotation("000003", "Unknown")
+        self.assertEqual(selected.clear_annotations(), 2)
+        for task_id in ("000001", "000002", "000003"):
+            self.assertFalse((self.root / "samples" / task_id / "annotation.json").exists())
+
     def test_media_resolution_rejects_escape_and_missing_file(self):
         with self.assertRaises(ValueError):
             self.index.resolve_media("../secret.txt")
@@ -112,6 +140,7 @@ class ResultDashboardTest(unittest.TestCase):
                 manifest = json.load(response)
                 self.assertEqual(manifest["total"], 3)
                 self.assertEqual(manifest["default_page_size"], 2)
+                self.assertIn("Self-correction", manifest["cos_types"])
             with open_direct(base + "/api/samples?page=1&page_size=2", timeout=3) as response:
                 payload = json.load(response)
                 self.assertEqual(len(payload["items"]), 2)
@@ -124,6 +153,25 @@ class ResultDashboardTest(unittest.TestCase):
             with self.assertRaises(HTTPError) as context:
                 open_direct(base + "/api/samples?page=0&page_size=2", timeout=3)
             self.assertEqual(context.exception.code, 400)
+
+            annotation_request = Request(
+                base + "/api/annotation",
+                data=json.dumps(
+                    {"task_id": "000002", "cos_type": "Perception Before Action"}
+                ).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with open_direct(annotation_request, timeout=3) as response:
+                self.assertTrue(json.load(response)["ok"])
+            annotation = json.loads(
+                (self.root / "samples" / "000002" / "annotation.json").read_text()
+            )
+            self.assertEqual(annotation["cos_type"], "Perception Before Action")
+
+            clear_request = Request(base + "/api/annotations", method="DELETE")
+            with open_direct(clear_request, timeout=3) as response:
+                self.assertEqual(json.load(response)["cleared"], 1)
         finally:
             server.shutdown()
             server.server_close()
