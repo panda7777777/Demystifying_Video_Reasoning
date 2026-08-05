@@ -183,6 +183,15 @@ def _load_wan_adapter(pipe: Any, dit: Any, path: str, alpha: float) -> None:
     state_dict = load_state_dict(
         path, torch_dtype=getattr(pipe, "torch_dtype", torch.bfloat16), device="cpu"
     )
+    # Accelerate/PEFT training checkpoints save keys relative to the complete
+    # training object.  In inference we load into one DiT at a time, so remove
+    # that wrapper prefix before handing the weights to DiffSynth's LoRA loader.
+    for prefix in ("pipe.dit.", "module.pipe.dit."):
+        if any(key.startswith(prefix) for key in state_dict):
+            state_dict = {
+                key.removeprefix(prefix): value for key, value in state_dict.items()
+            }
+            break
     if not any(key.endswith(".skip_proj.weight") for key in state_dict):
         pipe.load_lora(dit, state_dict=state_dict, alpha=alpha)
         return

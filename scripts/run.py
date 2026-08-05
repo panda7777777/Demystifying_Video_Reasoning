@@ -57,6 +57,47 @@ def generation_config(args: argparse.Namespace) -> GenerationConfig:
     return config
 
 
+def validate_adapter_paths(args: argparse.Namespace) -> None:
+    for option, value in (
+        ("--lora-path", args.lora_path),
+        ("--high-noise-lora-path", args.high_noise_lora_path),
+        ("--low-noise-lora-path", args.low_noise_lora_path),
+    ):
+        if value is None:
+            continue
+        path = Path(value).expanduser()
+        if not path.is_file():
+            kind = "directory" if path.is_dir() else "missing path"
+            raise ValueError(f"{option} must name a checkpoint file, got {kind}: {path}")
+
+
+def validate_cuda_runtime(args: argparse.Namespace, gpu: str) -> None:
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
+    check = subprocess.run(
+        [
+            str(args.python),
+            "-c",
+            "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)",
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    if check.returncode != 0:
+        detail = (check.stderr or check.stdout).strip().splitlines()
+        diagnostic = next(
+            (line.strip() for line in detail if "Error " in line or "CUDA initialization" in line),
+            detail[-1].strip() if detail else "",
+        )
+        suffix = f" Diagnostic: {diagnostic}" if diagnostic else ""
+        raise ValueError(
+            f"CUDA is unavailable to {args.python} with CUDA_VISIBLE_DEVICES={gpu}."
+            f" Verify that the job/container has /dev/nvidia* devices and that the "
+            f"NVIDIA driver supports this PyTorch CUDA build.{suffix}"
+        )
+
+
 def run_name(args: argparse.Namespace) -> str:
     stamp = datetime.now(ZoneInfo("Asia/Singapore")).strftime("%Y%m%d_%H%M")
     return f"{stamp}_{MODEL_SHORT[model_family(args.model)]}_{DATASET_SHORT[args.dataset]}"
@@ -238,6 +279,8 @@ def orchestrate(args: argparse.Namespace) -> int:
     gpus = [item.strip() for item in args.gpus.split(",") if item.strip()] if args.gpus else detect_gpus()
     if not gpus:
         raise ValueError("No GPUs selected or detected")
+    if not args.dry_run:
+        validate_cuda_runtime(args, gpus[0])
     if args.resume_dir is not None:
         run_dir = args.resume_dir.resolve()
         manifest_path = run_dir / "run.json"
@@ -406,6 +449,7 @@ def main() -> int:
     try:
         args.model = validate_model_source(args.model)
         model_family(args.model)
+        validate_adapter_paths(args)
         if args.max_size <= 0 or args.overview_columns <= 0 or args.batch_size <= 0:
             raise ValueError("--max-size, --overview-columns, and --batch-size must be positive")
         if args.stage == "worker":

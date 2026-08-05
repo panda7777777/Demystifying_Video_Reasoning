@@ -43,6 +43,32 @@ Recent advances in video generation have revealed an unexpected phenomenon: diff
 
 ## Installation
 
+### Visualization results dashboard
+
+Launch the offline dashboard for the latest Language-Table visualization run:
+
+```bash
+python tools/results_dashboard.py
+```
+
+Open `http://<server-ip>:8000` in a browser. Use `A`/`D`, the left/right arrow
+keys, or enter a page number to navigate. The default five samples per page
+can be changed from the UI or at launch time:
+
+```bash
+python tools/results_dashboard.py \
+  --result-dir output/20260804_1513_wan22_ltable \
+  --page-size 8 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+The server uses only the Python standard library. It dynamically discovers
+available denoising steps and serves only media from the selected result
+directory.
+
+### Python environment
+
 ```bash
 pip install -e .
 pip install matplotlib scikit-learn   # for token visualization
