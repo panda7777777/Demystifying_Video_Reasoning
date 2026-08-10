@@ -32,7 +32,7 @@ from scripts._visualization import (
     validate_model_source,
 )
 
-MODEL_SHORT = {"wan2.2": "wan22", "wan2.1": "wan21", "ltx2.3": "ltx23", "vbvr-wan2.2": "vbvr22"}
+MODEL_SHORT = {"wan2.2": "wan22", "wan2.1": "wan21", "ltx2.3": "ltx23", "vbvr-wan2.2": "vbvr22", "lvp": "lvp"}
 DATASET_SHORT = {"language-table": "ltable", "rmbench": "rmbench", "custom": "custom"}
 IMMUTABLE_MANIFEST_KEYS = (
     "name", "dataset", "data_dir", "selection", "split", "generation",
@@ -62,6 +62,7 @@ def validate_adapter_paths(args: argparse.Namespace) -> None:
         ("--lora-path", args.lora_path),
         ("--high-noise-lora-path", args.high_noise_lora_path),
         ("--low-noise-lora-path", args.low_noise_lora_path),
+        ("--lvp-checkpoint", args.lvp_checkpoint),
     ):
         if value is None:
             continue
@@ -69,6 +70,10 @@ def validate_adapter_paths(args: argparse.Namespace) -> None:
         if not path.is_file():
             kind = "directory" if path.is_dir() else "missing path"
             raise ValueError(f"{option} must name a checkpoint file, got {kind}: {path}")
+    if model_family(args.model) == "lvp":
+        if args.lvp_base_model is None or args.lvp_checkpoint is None:
+            raise ValueError("--model large-video-planner requires --lvp-base-model and --lvp-checkpoint")
+        validate_model_source(args.lvp_base_model)
 
 
 def validate_cuda_runtime(args: argparse.Namespace, gpu: str) -> None:
@@ -123,6 +128,8 @@ def make_manifest(
             "high_noise": args.high_noise_lora_path,
             "low_noise": args.low_noise_lora_path,
             "scale": args.lora_alpha,
+            "lvp_base_model": args.lvp_base_model,
+            "lvp_checkpoint": args.lvp_checkpoint,
         },
         "processing": {
             "max_size": args.max_size,
@@ -212,6 +219,7 @@ def worker_options(args: argparse.Namespace, run_dir: Path, assignment: Path) ->
         ("--negative-prompt", args.negative_prompt),
         ("--lora-path", args.lora_path), ("--high-noise-lora-path", args.high_noise_lora_path),
         ("--low-noise-lora-path", args.low_noise_lora_path),
+        ("--lvp-base-model", args.lvp_base_model), ("--lvp-checkpoint", args.lvp_checkpoint),
     ):
         if value is not None:
             values.extend((option, str(value)))
@@ -225,6 +233,7 @@ def worker(args: argparse.Namespace) -> int:
         args.model, lora_path=args.lora_path,
         high_noise_lora_path=args.high_noise_lora_path, low_noise_lora_path=args.low_noise_lora_path,
         lora_alpha=args.lora_alpha,
+        lvp_base_model=args.lvp_base_model, lvp_checkpoint=args.lvp_checkpoint,
     )
     failures = 0
     for sample in samples:
@@ -435,6 +444,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--high-noise-lora-path")
     parser.add_argument("--low-noise-lora-path")
     parser.add_argument("--lora-alpha", type=float, default=1.0)
+    parser.add_argument("--lvp-base-model", help="Wan2.1-I2V-14B-480P directory used by LVP")
+    parser.add_argument("--lvp-checkpoint", help="LVP Lightning .ckpt fine-tuned weights")
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--run-name", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true")

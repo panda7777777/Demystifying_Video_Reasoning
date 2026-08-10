@@ -36,6 +36,8 @@ class SharedWorkflowTests(unittest.TestCase):
             "Wan-AI/Wan2.2-I2V-A14B",
         )
         self.assertEqual(model_family("Wan-AI/Wan2.1-I2V-14B-720P"), "wan2.1")
+        self.assertEqual(validate_model_source("lvp"), "large-video-planner")
+        self.assertEqual(model_family("large-video-planner"), "lvp")
         with self.assertRaises(ValueError):
             validate_model_source("wan2.2")
         with self.assertRaises(ValueError):

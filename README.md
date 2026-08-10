@@ -112,6 +112,25 @@ huggingface-cli download Video-Reason/VBVR-Wan2.2-diffsynth --local-dir ./models
 huggingface-cli download Video-Reason/VBVR-LTX2.3-diffsynth --local-dir ./models/VBVR/VBVR-LTX2.3-diffsynth
 ```
 
+#### Large Video Planner (LVP)
+
+LVP uses the Wan2.1 I2V 14B 480P components plus its full fine-tuned
+Lightning checkpoint. Both paths are supplied explicitly, so the 66 GB LVP
+checkpoint is memory-mapped and no weight conversion or copy is required:
+
+```bash
+python scripts/run.py \
+  --model large-video-planner \
+  --lvp-base-model /mnt/umm/users/zuojing/models/Wan2.1-I2V-14B-480P \
+  --lvp-checkpoint /mnt/umm/users/zuojing/models/LVP/checkpoints/lvp_14B.ckpt \
+  --dataset custom \
+  --data-dir examples/custom_dataset \
+  --gpus 0
+```
+
+`lvp` is accepted as a shorter model alias. The base directory must contain
+the Wan diffusion shards, T5, VAE, CLIP, and `google/umt5-xxl` tokenizer.
+
 ## Evaluation Data
 
 Download the VBVR-Bench evaluation data from Hugging Face:
@@ -139,6 +158,43 @@ data/VBVR-Bench/
 ```
 
 ## Tools
+
+### Compose intermediate steps into a GIF
+
+Create a publication-style animated strip with a frozen initial frame, five
+uniformly sampled intermediate-step videos, and a centered input prompt:
+
+```bash
+python tools/compose_step_gif.py \
+  --videos output/sample/steps/*.mp4 \
+  --initial-image output/sample/input/initial_frame.png \
+  --prompt-file output/sample/input/prompt.txt \
+  --num-steps 5 \
+  --output output/sample/step_progression.gif
+```
+
+The initial image is optional; without it, the first frame of the earliest
+selected video is frozen. Videos are naturally sorted (`step_2` before
+`step_10`), sampled at equal intervals including both endpoints, synchronized
+to the shortest clip, and letterboxed to preserve aspect ratio. Use `--fps`
+and `--panel-width` to trade file size for temporal or spatial resolution.
+
+For an existing experiment run, batch-process selected dataset indices with:
+
+```bash
+python tools/batch_compose_step_gifs.py \
+  --result-dir output/20260807_1527_wan22_ltable \
+  --indices '37,998,11,22,47,985,986,987,997,8,29,41,45,1,14,15,39,54,999'
+```
+
+The script resolves each requested value against `source.index` in the sample
+metadata. GIFs are written to `<result-dir>/visualizations/step_gifs` by
+default. The compact layout hides panel titles, uses the bundled Times New
+Roman Bold font in `assets/fonts`, and leaves three pixels between panels.
+Use `--font-path /path/to/timesbd.ttf` to override it. Add `--show-labels` when
+step titles are needed. Existing files are skipped unless `--overwrite` is
+supplied. Prompt text scales with panel resolution (24 px at the default
+256-pixel panel width, or 60 px with `--panel-width 640`).
 
 ### 1. Per-Diffusion-Step Visualization (VBVR-Bench)
 

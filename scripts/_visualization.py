@@ -24,13 +24,16 @@ LTX_NEGATIVE_PROMPT = (
     "flickering, motion blur, distorted proportions, artifacts"
 )
 
-SUPPORTED_MODEL_FAMILIES = ("wan2.2", "wan2.1", "ltx2.3", "vbvr-wan2.2")
-WAN_MODELS = frozenset({"wan2.2", "wan2.1", "vbvr-wan2.2"})
+LVP_MODEL_NAMES = frozenset({"lvp", "large-video-planner"})
+SUPPORTED_MODEL_FAMILIES = ("wan2.2", "wan2.1", "ltx2.3", "vbvr-wan2.2", "lvp")
+WAN_MODELS = frozenset({"wan2.2", "wan2.1", "vbvr-wan2.2", "lvp"})
 HF_REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def validate_model_source(model: str) -> str:
     """Validate and normalize an absolute directory or Hugging Face repo id."""
+    if model.lower() in LVP_MODEL_NAMES:
+        return "large-video-planner"
     path = Path(model)
     if path.is_absolute():
         if not path.is_dir():
@@ -47,6 +50,8 @@ def validate_model_source(model: str) -> str:
 def model_family(model: str) -> str:
     """Infer the supported pipeline family from a model source."""
     name = model.rstrip("/").rsplit("/", 1)[-1].lower()
+    if name in LVP_MODEL_NAMES:
+        return "lvp"
     if "vbvr" in name and "wan2.2" in name:
         return "vbvr-wan2.2"
     if "wan2.2" in name:
@@ -267,6 +272,8 @@ def build_pipeline(
     high_noise_lora_path: str | None = None,
     low_noise_lora_path: str | None = None,
     lora_alpha: float = 1.0,
+    lvp_base_model: str | None = None,
+    lvp_checkpoint: str | None = None,
 ):
     """Build a supported visualization pipeline."""
     import torch
@@ -276,6 +283,15 @@ def build_pipeline(
     model = validate_model_source(model)
     family = model_family(model)
     config = _vram_config(torch)
+    if family == "lvp":
+        if lvp_base_model is None or lvp_checkpoint is None:
+            raise ValueError(
+                "LVP requires both lvp_base_model and lvp_checkpoint"
+            )
+        model = validate_model_source(lvp_base_model)
+        checkpoint = Path(lvp_checkpoint).expanduser()
+        if not checkpoint.is_file():
+            raise ValueError(f"LVP checkpoint is not a file: {checkpoint}")
 
     def source_config(
         pattern: str | None = None,
@@ -323,13 +339,33 @@ def build_pipeline(
             ],
             tokenizer_config=source_config("google/umt5-xxl/", source=base_source, with_vram=False),
         )
-    elif family == "wan2.1":
+    elif family in {"wan2.1", "lvp"}:
+        dit_config = source_config("diffusion_pytorch_model*.safetensors")
+        if family == "lvp":
+            # LVP publishes a Lightning checkpoint containing the complete
+            # training module.  DiffSynth's Wan converter expects the DiT
+            # keys only; mmap keeps the 66 GB checkpoint from being copied
+            # into RAM while the CPU-offloaded model is initialized.
+            checkpoint_data = torch.load(
+                checkpoint, map_location="cpu", mmap=True, weights_only=True
+            )
+            state_dict = checkpoint_data.get("state_dict")
+            if not isinstance(state_dict, dict):
+                raise ValueError(f"LVP checkpoint has no state_dict: {checkpoint}")
+            dit_state_dict = {
+                key.removeprefix("model."): value
+                for key, value in state_dict.items()
+                if key.startswith("model.")
+            }
+            if not dit_state_dict:
+                raise ValueError(f"LVP checkpoint has no model.* tensors: {checkpoint}")
+            dit_config.state_dict = dit_state_dict
         pipe = WanVideoPipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
             device="cuda",
             redirect_common_files=False,
             model_configs=[
-                source_config("diffusion_pytorch_model*.safetensors"),
+                dit_config,
                 source_config("models_t5_umt5-xxl-enc-bf16.pth"),
                 source_config("Wan2.1_VAE.pth"),
                 source_config("models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
