@@ -28,6 +28,7 @@ COS_TYPES = (
     "Self-correction",
     "Perception Before Action",
 )
+_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -161,35 +162,53 @@ class ResultIndex:
             video = sample.path / "output" / "steps" / name / "video.mp4"
             if video.is_file():
                 step_videos[name] = self.media_url(video)
+        annotation = self._read_annotation(sample)
         return {
             "task_id": sample.task_id,
             "prompt": prompt,
             "initial_frame": self.media_url(frame) if frame.is_file() else None,
-            "cos_type": self._read_annotation(sample),
+            **annotation,
             "step_videos": step_videos,
         }
 
     @staticmethod
-    def _read_annotation(sample: Sample) -> str | None:
+    def _read_annotation(sample: Sample) -> dict[str, object]:
         try:
             data = json.loads((sample.path / ANNOTATION_FILENAME).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return "Unknown"
-        value = data.get("cos_type") if isinstance(data, dict) else None
-        return value if value in COS_TYPES else "Unknown"
+            data = {}
+        cos_type = data.get("cos_type") if isinstance(data, dict) else None
+        success = data.get("success") if isinstance(data, dict) else None
+        return {
+            "cos_type": cos_type if cos_type in COS_TYPES else "Unknown",
+            "success": success if isinstance(success, bool) else None,
+        }
 
-    def save_annotation(self, task_id: str, cos_type: str | None) -> None:
-        cos_type = "Unknown" if cos_type is None else cos_type
-        if cos_type not in COS_TYPES:
-            raise ValueError(f"无效的 CoS Type: {cos_type}")
+    def save_annotation(
+        self,
+        task_id: str,
+        cos_type: str | None | object = _UNSET,
+        success: bool | None | object = _UNSET,
+    ) -> dict[str, object]:
         sample = self._sample_by_id(task_id)
+        annotation = self._read_annotation(sample)
+        if cos_type is not _UNSET:
+            cos_type = "Unknown" if cos_type is None else cos_type
+            if cos_type not in COS_TYPES:
+                raise ValueError(f"无效的 CoS Type: {cos_type}")
+            annotation["cos_type"] = cos_type
+        if success is not _UNSET:
+            if success is not None and not isinstance(success, bool):
+                raise ValueError("success 必须是布尔值或 null")
+            annotation["success"] = success
         annotation_path = sample.path / ANNOTATION_FILENAME
         temporary_path = sample.path / f".{ANNOTATION_FILENAME}.tmp"
         temporary_path.write_text(
-            json.dumps({"cos_type": cos_type}, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(annotation, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
         temporary_path.replace(annotation_path)
+        return annotation
 
     def clear_annotations(self) -> int:
         cleared = 0
@@ -282,15 +301,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict) or not isinstance(payload.get("task_id"), str):
                 raise ValueError("请求必须包含 task_id")
-            cos_type = payload.get("cos_type")
+            if "cos_type" not in payload and "success" not in payload:
+                raise ValueError("请求必须包含 cos_type 或 success")
+            cos_type = payload.get("cos_type", _UNSET)
             if cos_type is not None and not isinstance(cos_type, str):
-                raise ValueError("cos_type 必须是字符串或 null")
+                if cos_type is not _UNSET:
+                    raise ValueError("cos_type 必须是字符串或 null")
+            success = payload.get("success", _UNSET)
+            if success is not _UNSET and success is not None and not isinstance(success, bool):
+                raise ValueError("success 必须是布尔值或 null")
             with self.server.annotation_lock:
-                self.server.index.save_annotation(payload["task_id"], cos_type)
+                annotation = self.server.index.save_annotation(
+                    payload["task_id"], cos_type=cos_type, success=success
+                )
         except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
-        self._send_json({"ok": True, "cos_type": cos_type})
+        self._send_json({"ok": True, **annotation})
 
     def do_DELETE(self) -> None:  # noqa: N802
         if urlparse(self.path).path != "/api/annotations":
@@ -441,9 +468,12 @@ INDEX_HTML = r'''<!doctype html>
     td.id { color:var(--blue); font-size:22px; font-weight:950; font-variant-numeric:tabular-nums; }
     td.prompt { font-size:20px; line-height:1.35; font-weight:900; overflow-wrap:anywhere; }
     th.annotation,td.annotation { width:250px; min-width:250px; }
+    th.success,td.success { width:150px; min-width:150px; }
     td.annotation { font-size:18px; font-weight:900; text-align:center; }
     .annotation-value { display:inline-block; padding:9px 12px; border-radius:10px; background:#e7edff; color:#284aa7; }
     .annotation-value.unset { background:#eeeae1; color:var(--muted); }
+    .annotation-value.success { background:#dff4e6; color:#17653a; }
+    .annotation-value.failure { background:#fbe4df; color:#9c3025; }
     .annotation-select { width:100%; padding:8px 10px; }
     .annotation-select.saving { opacity:.55; }
     .annotation-error { color:#a62f25; font-size:13px; margin-top:7px; }
@@ -485,9 +515,10 @@ INDEX_HTML = r'''<!doctype html>
     const shell=document.querySelector('#shell'), prev=document.querySelector('#prev'), next=document.querySelector('#next'), pageInput=document.querySelector('#page-number'), totalPagesLabel=document.querySelector('#total-pages'), sizeInput=document.querySelector('#page-size'), modeButton=document.querySelector('#toggle-mode'), clearButton=document.querySelector('#clear-annotations'), annotationsButton=document.querySelector('#toggle-annotations'), modeHint=document.querySelector('#mode-hint');
     const missing=label=>{const d=document.createElement('div');d.className='missing';d.textContent=label;return d};
     function mediaCell(kind,url,label){const td=document.createElement('td');td.className=kind==='video'?'step':'frame';if(!url){td.append(missing('暂无'+label));return td}const el=document.createElement(kind);el.src=url;el.preload='metadata';if(kind==='video'){el.autoplay=true;el.muted=true;el.loop=true;el.playsInline=true;el.controls=true;}else{el.alt=label;el.loading='lazy';}el.addEventListener('error',()=>el.replaceWith(missing(label+'加载失败')));td.append(el);return td}
-    async function saveAnnotation(item,select,cell){select.disabled=true;select.classList.add('saving');cell.querySelector('.annotation-error')?.remove();try{const cosType=select.value||null,response=await fetch('/api/annotation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_id:item.task_id,cos_type:cosType})}),data=await response.json();if(!response.ok)throw new Error(data.error||'保存失败');item.cos_type=cosType;}catch(error){select.value=item.cos_type||'';const message=document.createElement('div');message.className='annotation-error';message.textContent='保存失败：'+error.message;cell.append(message);}finally{select.disabled=false;select.classList.remove('saving')}}
-    function annotationCell(item){const td=document.createElement('td');td.className='annotation';if(state.annotationMode){const select=document.createElement('select');select.className='annotation-select';select.setAttribute('aria-label',`${item.task_id} 的 CoS Type`);state.cosTypes.forEach(label=>{const option=document.createElement('option');option.value=label;option.textContent=label;option.selected=item.cos_type===label;select.append(option)});select.addEventListener('change',()=>saveAnnotation(item,select,td));td.append(select);}else{const value=document.createElement('span');value.className='annotation-value';value.textContent=item.cos_type;td.append(value)}return td}
-    function render(data){state.data=data;const table=document.createElement('table'),head=document.createElement('thead'),hr=document.createElement('tr');[['任务 ID','id'],['提示词','prompt'],['初始帧','frame']].forEach(([text,cls])=>{const th=document.createElement('th');th.className=cls;th.textContent=text;hr.append(th)});if(!state.annotationsHidden){const th=document.createElement('th');th.className='annotation';th.textContent='CoS Type';hr.append(th)}data.steps.forEach(step=>{const th=document.createElement('th');th.className='step';th.textContent='Step '+Number(step.slice(5));hr.append(th)});head.append(hr);table.append(head);const body=document.createElement('tbody');data.items.forEach(item=>{const tr=document.createElement('tr'),id=document.createElement('td'),prompt=document.createElement('td');id.className='id';id.textContent=item.task_id;prompt.className='prompt';prompt.textContent=item.prompt||'暂无提示词';tr.append(id,prompt,mediaCell('img',item.initial_frame,'初始帧'));if(!state.annotationsHidden)tr.append(annotationCell(item));data.steps.forEach(step=>tr.append(mediaCell('video',item.step_videos[step],step)));body.append(tr)});table.append(body);shell.replaceChildren(data.items.length?table:Object.assign(document.createElement('div'),{className:'empty',textContent:'没有可展示的样本'}));document.querySelectorAll('video').forEach(v=>v.play().catch(()=>{}));}
+    async function saveAnnotation(item,select,cell,field){select.disabled=true;select.classList.add('saving');cell.querySelector('.annotation-error')?.remove();const previous=field==='cos_type'?item.cos_type:item.success;let next=select.value;if(field==='success')next=next==='true'?true:next==='false'?false:null;try{const response=await fetch('/api/annotation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_id:item.task_id,[field]:next})}),data=await response.json();if(!response.ok)throw new Error(data.error||'保存失败');item.cos_type=data.cos_type;item.success=data.success;}catch(error){select.value=field==='cos_type'?previous:(previous===true?'true':previous===false?'false':'');const message=document.createElement('div');message.className='annotation-error';message.textContent='保存失败：'+error.message;cell.append(message);}finally{select.disabled=false;select.classList.remove('saving')}}
+    function annotationCell(item){const td=document.createElement('td');td.className='annotation';if(state.annotationMode){const select=document.createElement('select');select.className='annotation-select';select.setAttribute('aria-label',`${item.task_id} 的 CoS Type`);state.cosTypes.forEach(label=>{const option=document.createElement('option');option.value=label;option.textContent=label;option.selected=item.cos_type===label;select.append(option)});select.addEventListener('change',()=>saveAnnotation(item,select,td,'cos_type'));td.append(select);}else{const value=document.createElement('span');value.className='annotation-value';value.textContent=item.cos_type;td.append(value)}return td}
+    function successCell(item){const td=document.createElement('td');td.className='annotation success';if(state.annotationMode){const select=document.createElement('select');select.className='annotation-select';select.setAttribute('aria-label',`${item.task_id} 是否成功`);[['','未标注'],['true','成功'],['false','失败']].forEach(([optionValue,label])=>{const option=document.createElement('option');option.value=optionValue;option.textContent=label;option.selected=(item.success===true?'true':item.success===false?'false':'')===optionValue;select.append(option)});select.addEventListener('change',()=>saveAnnotation(item,select,td,'success'));td.append(select);}else{const value=document.createElement('span');value.className='annotation-value '+(item.success===true?'success':item.success===false?'failure':'unset');value.textContent=item.success===true?'成功':item.success===false?'失败':'未标注';td.append(value)}return td}
+    function render(data){state.data=data;const table=document.createElement('table'),head=document.createElement('thead'),hr=document.createElement('tr');[['任务 ID','id'],['提示词','prompt'],['初始帧','frame']].forEach(([text,cls])=>{const th=document.createElement('th');th.className=cls;th.textContent=text;hr.append(th)});if(!state.annotationsHidden){[['CoS Type','annotation'],['是否成功','annotation success']].forEach(([text,cls])=>{const th=document.createElement('th');th.className=cls;th.textContent=text;hr.append(th)})}data.steps.forEach(step=>{const th=document.createElement('th');th.className='step';th.textContent='Step '+Number(step.slice(5));hr.append(th)});head.append(hr);table.append(head);const body=document.createElement('tbody');data.items.forEach(item=>{const tr=document.createElement('tr'),id=document.createElement('td'),prompt=document.createElement('td');id.className='id';id.textContent=item.task_id;prompt.className='prompt';prompt.textContent=item.prompt||'暂无提示词';tr.append(id,prompt,mediaCell('img',item.initial_frame,'初始帧'));if(!state.annotationsHidden)tr.append(annotationCell(item),successCell(item));data.steps.forEach(step=>tr.append(mediaCell('video',item.step_videos[step],step)));body.append(tr)});table.append(body);shell.replaceChildren(data.items.length?table:Object.assign(document.createElement('div'),{className:'empty',textContent:'没有可展示的样本'}));document.querySelectorAll('video').forEach(v=>v.play().catch(()=>{}));}
     async function load(page=state.page){if(state.loading)return;state.loading=true;shell.classList.add('loading');try{const response=await fetch(`/api/samples?page=${page}&page_size=${state.pageSize}`);const data=await response.json();if(!response.ok)throw new Error(data.error||'请求失败');state.page=data.page;state.totalPages=data.total_pages;render(data);pageInput.value=data.page;pageInput.max=data.total_pages;totalPagesLabel.textContent=`${data.total_pages} · 共 ${data.total} 条`;prev.disabled=data.page<=1;next.disabled=data.page>=data.total_pages;history.replaceState(null,'',`#page=${data.page}`);}catch(error){shell.innerHTML=`<div class="error"></div>`;shell.firstChild.textContent='加载失败：'+error.message;}finally{state.loading=false;shell.classList.remove('loading')}}
     function changePage(delta){const target=Math.max(1,Math.min(state.totalPages,state.page+delta));if(target!==state.page)load(target)}
     function jumpToPage(){const value=Number(pageInput.value);if(Number.isInteger(value)&&value>=1){load(Math.min(value,state.totalPages))}else pageInput.value=state.page}

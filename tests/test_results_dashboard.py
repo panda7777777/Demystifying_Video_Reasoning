@@ -84,17 +84,29 @@ class ResultDashboardTest(unittest.TestCase):
         self.assertEqual(json.loads(annotation_path.read_text())["cos_type"], "Multi-Path")
         item = self.index.page(1, 2)["items"][1]
         self.assertEqual(item["cos_type"], "Multi-Path")
+        self.assertIsNone(item["success"])
+
+        self.index.save_annotation("000001", success=True)
+        annotation = json.loads(annotation_path.read_text())
+        self.assertEqual(annotation, {"cos_type": "Multi-Path", "success": True})
 
         self.index.save_annotation("000001", None)
-        self.assertEqual(json.loads(annotation_path.read_text())["cos_type"], "Unknown")
-        self.assertEqual(self.index.page(1, 2)["items"][1]["cos_type"], "Unknown")
+        annotation = json.loads(annotation_path.read_text())
+        self.assertEqual(annotation, {"cos_type": "Unknown", "success": True})
+        item = self.index.page(1, 2)["items"][1]
+        self.assertEqual(item["cos_type"], "Unknown")
+        self.assertTrue(item["success"])
 
     def test_missing_annotation_is_unknown(self):
-        self.assertEqual(self.index.page(1, 2)["items"][0]["cos_type"], "Unknown")
+        item = self.index.page(1, 2)["items"][0]
+        self.assertEqual(item["cos_type"], "Unknown")
+        self.assertIsNone(item["success"])
 
     def test_annotation_rejects_invalid_type_and_unknown_sample(self):
         with self.assertRaises(ValueError):
             self.index.save_annotation("000001", "Other")
+        with self.assertRaises(ValueError):
+            self.index.save_annotation("000001", success="yes")
         with self.assertRaises(ValueError):
             self.index.save_annotation("missing", "Unknown")
 
@@ -136,6 +148,7 @@ class ResultDashboardTest(unittest.TestCase):
                 page_html = response.read()
                 self.assertIn(b"Step Observatory", page_html)
                 self.assertIn(b'id="page-number"', page_html)
+                self.assertIn("是否成功".encode(), page_html)
             with open_direct(base + "/api/manifest", timeout=3) as response:
                 manifest = json.load(response)
                 self.assertEqual(manifest["total"], 3)
@@ -157,7 +170,11 @@ class ResultDashboardTest(unittest.TestCase):
             annotation_request = Request(
                 base + "/api/annotation",
                 data=json.dumps(
-                    {"task_id": "000002", "cos_type": "Perception Before Action"}
+                    {
+                        "task_id": "000002",
+                        "cos_type": "Perception Before Action",
+                        "success": False,
+                    }
                 ).encode(),
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -168,6 +185,7 @@ class ResultDashboardTest(unittest.TestCase):
                 (self.root / "samples" / "000002" / "annotation.json").read_text()
             )
             self.assertEqual(annotation["cos_type"], "Perception Before Action")
+            self.assertFalse(annotation["success"])
 
             clear_request = Request(base + "/api/annotations", method="DELETE")
             with open_direct(clear_request, timeout=3) as response:
