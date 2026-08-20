@@ -16,7 +16,7 @@ NUM_NODES="${WORLD_SIZE:-4}"
 # multi-node launcher). Keep NODE_RANK as a manual fallback for local runs.
 NODE_RANK="${RANK:-${NODE_RANK:-0}}"
 GPUS="0,1,2,3,4,5,6,7"
-BATCH_SIZE="1"
+BATCH_SIZE="2"
 
 NUM_FRAMES="49"
 NUM_INFERENCE_STEPS="30"
@@ -126,6 +126,32 @@ find_resume_dir() {
   [[ -n "${best}" ]] && printf '%s\n' "${best}"
 }
 
+resume_is_complete() {
+  # Keep this check lightweight and identical across nodes. A sample counts
+  # only when its output metadata matches the immutable generation config.
+  "${PYTHON}" - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+run_dir = Path(sys.argv[1])
+manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+expected_generation = manifest.get("generation")
+sample_ids = manifest.get("samples")
+if not isinstance(sample_ids, list):
+    raise SystemExit(1)
+for sample_id in sample_ids:
+    metadata_path = run_dir / "samples" / sample_id / "output" / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        raise SystemExit(1)
+    if metadata.get("sample_id") != sample_id or metadata.get("generation") != expected_generation:
+        raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 data_dirs=()
 while IFS= read -r -d '' data_dir; do
@@ -173,6 +199,10 @@ for data_dir in "${data_dirs[@]}"; do
   fi
 
   echo "[dataset] ${task_name}: ${data_dir}"
+  if [[ -n "${resume_dir}" ]] && resume_is_complete "${resume_dir}"; then
+    echo "[skip] ${task_name}: resume directory is already complete"
+    continue
+  fi
   if ! wait_for_task_barrier "${task_name}" "start" "ready"; then
     failures+=("${task_name}: start barrier")
     break
