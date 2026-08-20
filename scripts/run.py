@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -200,6 +201,27 @@ def completed_sample_ids(run_dir: Path, samples: list[Sample], config: Generatio
     return completed
 
 
+def shard_pending_indices(
+    samples: list[Sample],
+    completed: set[str],
+    *,
+    node_rank: int,
+    num_nodes: int,
+    slots: list[str],
+) -> dict[str, list[int]]:
+    """Keep sample ownership stable when nodes observe different resume state."""
+    assignments = shard_indices(
+        list(range(len(samples))),
+        node_rank=node_rank,
+        num_nodes=num_nodes,
+        gpus=slots,
+    )
+    return {
+        slot: [index for index in indices if samples[index].sample_id not in completed]
+        for slot, indices in assignments.items()
+    }
+
+
 def persisted_samples(run_dir: Path, sample_ids: list[str]) -> list[Sample] | None:
     """Load immutable prepared inputs, or return None when preparation was interrupted."""
     samples = []
@@ -254,7 +276,7 @@ def worker(args: argparse.Namespace) -> int:
     for sample in samples:
         sample_dir = args.run_dir / "samples" / sample.sample_id
         output_dir = sample_dir / "output"
-        temporary = sample_dir / f".output.{os.getpid()}.tmp"
+        temporary = sample_dir / f".output.{uuid.uuid4().hex}.tmp"
         try:
             if (output_dir / "metadata.json").is_file():
                 print(f"[skip] {sample.sample_id}", flush=True)
@@ -289,6 +311,10 @@ def worker(args: argparse.Namespace) -> int:
                 from diffsynth.utils.data import save_video
                 save_video(video, str(video_path), fps=args.fps, quality=5)
             atomic_write_json(temporary / "metadata.json", {"sample_id": sample.sample_id, "source": sample.source, "generation": config.to_dict()})
+            if (output_dir / "metadata.json").is_file():
+                shutil.rmtree(temporary)
+                print(f"[skip] {sample.sample_id}: completed by another worker", flush=True)
+                continue
             temporary.replace(output_dir)
             print(f"[complete] {sample.sample_id}", flush=True)
         except Exception as error:  # noqa: BLE001 -- isolate failures by sample
@@ -350,11 +376,12 @@ def orchestrate(args: argparse.Namespace) -> int:
     # independent inference calls in flight without changing model internals.
     slots = [(gpu, slot) for gpu in gpus for slot in range(args.batch_size)]
     slot_names = [f"{gpu}_{slot}" for gpu, slot in slots]
-    assignments = shard_indices(
-        list(range(len(samples_to_run))),
+    assignments = shard_pending_indices(
+        samples,
+        completed,
         node_rank=args.node_rank,
         num_nodes=args.num_nodes,
-        gpus=slot_names,
+        slots=slot_names,
     )
     print(f"[run] {run_dir}")
     print(
@@ -389,7 +416,7 @@ def orchestrate(args: argparse.Namespace) -> int:
             continue
         assigned = []
         for index in indices:
-            sample = samples_to_run[index]
+            sample = samples[index]
             input_dir = run_dir / "samples" / sample.sample_id / "input"
             image_path = input_dir / "initial_frame.png"
             saved = persisted_samples(run_dir, [sample.sample_id]) if existing_manifest is not None else None

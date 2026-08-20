@@ -12,7 +12,9 @@ OUTPUT_DIR="./output"
 SELECTION="all"
 SPLIT=""
 NUM_NODES="4"
-NODE_RANK="${NODE_RANK:-0}"
+# Cluster launchers inject RANK for the current node (as in the reference
+# multi-node launcher). Keep NODE_RANK as a manual fallback for local runs.
+NODE_RANK="${RANK:-${NODE_RANK:-0}}"
 GPUS="0,1,2,3,4,5,6,7"
 BATCH_SIZE="1"
 

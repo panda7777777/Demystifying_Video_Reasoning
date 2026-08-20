@@ -11,7 +11,12 @@ from PIL import Image
 from scripts._batch_visualization import parse_indices, shard_indices
 from scripts._datasets import Sample, discover, prepare_image
 from scripts._results import render_overview
-from scripts.run import completed_sample_ids, persisted_samples, validate_resume_manifest
+from scripts.run import (
+    completed_sample_ids,
+    persisted_samples,
+    shard_pending_indices,
+    validate_resume_manifest,
+)
 from scripts._visualization import (
     GenerationConfig,
     model_family,
@@ -65,6 +70,27 @@ class SharedWorkflowTests(unittest.TestCase):
         assigned = [index for node in nodes for values in node.values() for index in values]
         self.assertEqual(sorted(assigned), indices)
         self.assertEqual(len(assigned), len(set(assigned)))
+
+    def test_resume_sharding_is_stable_across_different_completed_views(self):
+        samples = [Sample(f"sample-{index}", "image.png", "prompt", {}) for index in range(12)]
+        slots = ["0_0", "1_0"]
+        completed_by_node = ({"sample-0", "sample-5"}, {"sample-1", "sample-8"})
+        baseline = [
+            shard_pending_indices(samples, set(), node_rank=rank, num_nodes=2, slots=slots)
+            for rank in range(2)
+        ]
+
+        for rank, completed in enumerate(completed_by_node):
+            resumed = shard_pending_indices(
+                samples, completed, node_rank=rank, num_nodes=2, slots=slots,
+            )
+            self.assertEqual(
+                resumed,
+                {
+                    slot: [index for index in indices if samples[index].sample_id not in completed]
+                    for slot, indices in baseline[rank].items()
+                },
+            )
 
     def test_custom_discovery_and_normalization(self):
         with tempfile.TemporaryDirectory() as temporary:
