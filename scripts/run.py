@@ -404,10 +404,10 @@ def orchestrate(args: argparse.Namespace) -> int:
     atomic_write_json(manifest_path, manifest)
     runtime = run_dir / "runtime"
     runtime.mkdir(exist_ok=True)
-    runtime_suffix = (
-        f"_resume_{datetime.now(ZoneInfo('Asia/Singapore')).strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-        if existing_manifest is not None else ""
-    )
+    # Resume runs intentionally reuse the stable per-node filenames.  This
+    # replaces logs/assignments from the previous attempt while completed
+    # samples remain skipped by `completed_sample_ids`.
+    runtime_suffix = ""
     processes = []
     environment_base = dict(os.environ)
     for gpu, slot in slots:
