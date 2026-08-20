@@ -471,8 +471,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-dir", type=Path, help="Resume an existing run directory")
     parser.add_argument("--selection", default="all", help="custom: ids; Language-Table: indices/slices; RMBench: tasks:episode-slice")
     parser.add_argument("--split", help="Defaults to train for Language-Table and seen for RMBench")
-    parser.add_argument("--num-nodes", type=int, default=1)
-    parser.add_argument("--node-rank", type=int, default=int(os.environ.get("NODE_RANK", "0")))
+    parser.add_argument(
+        "--num-nodes", type=int,
+        default=int(os.environ.get("WORLD_SIZE", "1")),
+    )
+    parser.add_argument(
+        "--node-rank", type=int,
+        default=int(os.environ.get("RANK", os.environ.get("NODE_RANK", "0"))),
+    )
     parser.add_argument("--gpus", help="Comma-separated local GPU ids; auto-detected when omitted")
     parser.add_argument(
         "--batch-size", type=int, default=1,
@@ -508,6 +514,10 @@ def main() -> int:
         args.task_name = validate_task_name(args.task_name)
         model_family(args.model)
         validate_adapter_paths(args)
+        if args.num_nodes <= 0 or not 0 <= args.node_rank < args.num_nodes:
+            raise ValueError(
+                f"invalid node configuration rank={args.node_rank}, num_nodes={args.num_nodes}"
+            )
         if args.max_size <= 0 or args.overview_columns <= 0 or args.batch_size <= 0:
             raise ValueError("--max-size, --overview-columns, and --batch-size must be positive")
         if args.stage == "worker":
