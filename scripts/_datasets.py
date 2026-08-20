@@ -38,7 +38,10 @@ def _custom(data_dir: Path, selection: str) -> list[Sample]:
             prompt = prompt_file.read_text(encoding="utf-8").strip()
             if prompt:
                 samples.append(Sample(directory.name, str(image.resolve()), prompt, {"directory": str(directory.resolve())}))
-    if selection.lower() not in {"all", ":"}:
+    if ":" in selection and selection != ":":
+        positions = set(parse_indices(selection, len(samples)))
+        samples = [sample for position, sample in enumerate(samples) if position in positions]
+    elif selection.lower() not in {"all", ":"}:
         wanted = {item.strip() for item in selection.split(",") if item.strip()}
         unknown = wanted - {sample.sample_id for sample in samples}
         if unknown:

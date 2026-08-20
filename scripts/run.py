@@ -103,9 +103,24 @@ def validate_cuda_runtime(args: argparse.Namespace, gpu: str) -> None:
         )
 
 
+def validate_task_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        raise ValueError("--task-name must not be empty")
+    if value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value:
+        raise ValueError("--task-name must be a single safe path component")
+    return value
+
+
 def run_name(args: argparse.Namespace) -> str:
     stamp = datetime.now(ZoneInfo("Asia/Singapore")).strftime("%Y%m%d_%H%M")
-    return f"{stamp}_{MODEL_SHORT[model_family(args.model)]}_{DATASET_SHORT[args.dataset]}"
+    parts = [stamp]
+    if args.task_name is not None:
+        parts.append(args.task_name)
+    parts.extend((MODEL_SHORT[model_family(args.model)], DATASET_SHORT[args.dataset]))
+    return "_".join(parts)
 
 
 def make_manifest(
@@ -422,6 +437,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", choices=tuple(DATASET_SHORT), default="custom")
     parser.add_argument("--data-dir", type=Path, default=REPO_ROOT / "examples" / "custom_dataset")
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "output")
+    parser.add_argument(
+        "--task-name",
+        help="Optional task suffix inserted before the model suffix in automatic run names",
+    )
     parser.add_argument("--resume-dir", type=Path, help="Resume an existing run directory")
     parser.add_argument("--selection", default="all", help="custom: ids; Language-Table: indices/slices; RMBench: tasks:episode-slice")
     parser.add_argument("--split", help="Defaults to train for Language-Table and seen for RMBench")
@@ -459,6 +478,7 @@ def main() -> int:
     args = parse_args()
     try:
         args.model = validate_model_source(args.model)
+        args.task_name = validate_task_name(args.task_name)
         model_family(args.model)
         validate_adapter_paths(args)
         if args.max_size <= 0 or args.overview_columns <= 0 or args.batch_size <= 0:

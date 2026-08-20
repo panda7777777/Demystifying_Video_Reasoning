@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image
 
@@ -17,10 +18,24 @@ from scripts._visualization import (
     parse_visualization_steps,
     validate_model_source,
 )
+from scripts.check_custom_data import discover_custom_roots, validate_custom_root
 from scripts.language_table.download import destination_path
+from scripts.run import run_name, validate_task_name
 
 
 class SharedWorkflowTests(unittest.TestCase):
+    def test_task_name_run_suffix(self):
+        base = SimpleNamespace(
+            model="Wan-AI/Wan2.2-I2V-A14B", dataset="custom", task_name=None,
+        )
+        self.assertRegex(run_name(base), r"^\d{8}_\d{4}_wan22_custom$")
+        base.task_name = "T001"
+        self.assertRegex(run_name(base), r"^\d{8}_\d{4}_T001_wan22_custom$")
+        self.assertEqual(validate_task_name("  shape_fit  "), "shape_fit")
+        for invalid in ("", "..", "group/task", "group\\task"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_task_name(invalid)
+
     def test_generation_validation(self):
         GenerationConfig(max_denoising_steps=10).validate()
         with self.assertRaises(ValueError):
@@ -60,10 +75,39 @@ class SharedWorkflowTests(unittest.TestCase):
             (sample / "prompt.txt").write_text("move left\n", encoding="utf-8")
             found = discover("custom", root, "all", "seen")
             self.assertEqual([item.sample_id for item in found], ["sample"])
+            self.assertEqual(
+                [item.sample_id for item in discover("custom", root, ":1", "seen")],
+                ["sample"],
+            )
             output = root / "normalized.png"
             self.assertEqual(prepare_image(found[0], output, 80), (80, 32))
             with Image.open(output) as image:
                 self.assertEqual(image.mode, "RGB")
+
+    def test_custom_integrity_validation_and_recursive_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            direct = root / "shape_fit" / "00"
+            nested = root / "shape_fit" / "T036_task-data-generator" / "T036_00000000"
+            for sample in (direct, nested):
+                sample.mkdir(parents=True)
+                Image.new("RGB", (16, 16)).save(sample / "input.png")
+                (sample / "prompt.txt").write_text("move\n", encoding="utf-8")
+            self.assertEqual(
+                discover_custom_roots(root),
+                [root / "shape_fit", root / "shape_fit" / "T036_task-data-generator"],
+            )
+            self.assertFalse(validate_custom_root(root / "shape_fit").errors)
+
+            broken = root / "broken" / "sample"
+            broken.mkdir(parents=True)
+            (broken / "input.png").write_bytes(b"not an image")
+            (broken / "input.jpg").write_bytes(b"not an image")
+            (broken / "prompt.txt").write_text("  \n", encoding="utf-8")
+            result = validate_custom_root(root / "broken")
+            self.assertEqual(result.sample_count, 1)
+            self.assertTrue(any("exactly one input image" in error for error in result.errors))
+            self.assertTrue(any("prompt is empty" in error for error in result.errors))
 
     def test_rmbench_discovery(self):
         with tempfile.TemporaryDirectory() as temporary:

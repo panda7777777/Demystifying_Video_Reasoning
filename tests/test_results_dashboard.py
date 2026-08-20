@@ -124,6 +124,17 @@ class ResultDashboardTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.index.resolve_media("samples/000001/not-there.mp4")
 
+    def test_media_urls_change_when_file_content_changes(self):
+        frame = self.root / "samples" / "000001" / "input" / "initial_frame.png"
+        first_url = self.index.media_url(frame)
+        self.assertIn("?v=", first_url)
+
+        frame.write_bytes(b"different-fake-png")
+
+        second_url = self.index.media_url(frame)
+        self.assertNotEqual(first_url, second_url)
+        self.assertEqual(first_url.split("?", 1)[0], second_url.split("?", 1)[0])
+
     def test_page_size_parser(self):
         self.assertEqual(positive_page_size("5"), 5)
         for value in ("0", "51", "nope"):

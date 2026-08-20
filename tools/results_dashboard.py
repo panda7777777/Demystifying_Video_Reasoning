@@ -229,7 +229,13 @@ class ResultIndex:
 
     def media_url(self, path: Path) -> str:
         relative = path.resolve().relative_to(self.root).as_posix()
-        return "/media/" + quote(relative, safe="/")
+        # Media paths repeat across runs (for example,
+        # samples/00/input/initial_frame.png).  Include a file-version token so
+        # switching the dashboard to another result directory cannot reuse a
+        # cached image or video from the previous run.
+        stat = path.stat()
+        version = f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+        return "/media/" + quote(relative, safe="/") + f"?v={version}"
 
     def resolve_media(self, raw_path: str) -> Path:
         relative = Path(unquote(raw_path))
