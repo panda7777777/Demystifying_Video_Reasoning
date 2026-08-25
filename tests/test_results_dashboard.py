@@ -65,6 +65,25 @@ class ResultDashboardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.index.page(0, 5)
 
+    def test_page_filters_by_cos_and_success_status(self):
+        self.index.save_annotation("000001", "Multi-Path", success=True)
+        self.index.save_annotation("000002", "Memory", success=False)
+
+        self.assertEqual(self.index.page(1, 5, cos_type="annotated")["total"], 2)
+        self.assertEqual(self.index.page(1, 5, cos_type="unannotated")["total"], 1)
+        self.assertEqual(self.index.page(1, 5, cos_type="Multi-Path")["total"], 1)
+        self.assertEqual(self.index.page(1, 5, success="annotated")["total"], 2)
+        self.assertEqual(self.index.page(1, 5, success="unannotated")["total"], 1)
+        self.assertEqual(self.index.page(1, 5, success="true")["total"], 1)
+        self.assertEqual(
+            self.index.page(1, 5, cos_type="Memory", success="false")["total"],
+            1,
+        )
+        with self.assertRaises(ValueError):
+            self.index.page(1, 5, cos_type="invalid")
+        with self.assertRaises(ValueError):
+            self.index.page(1, 5, success="invalid")
+
     def test_index_can_select_samples_by_zero_based_indices(self):
         selected = ResultIndex(self.root, data_indices=[2, 0])
         self.assertEqual(
@@ -135,6 +154,66 @@ class ResultDashboardTest(unittest.TestCase):
         self.assertNotEqual(first_url, second_url)
         self.assertEqual(first_url.split("?", 1)[0], second_url.split("?", 1)[0])
 
+    def test_multiple_result_dirs_merge_samples_and_route_by_run(self):
+        second_root = Path(self.temp_dir.name) / "second_run"
+        sample = second_root / "samples" / "000001"
+        (sample / "input").mkdir(parents=True)
+        (sample / "input" / "prompt.txt").write_text("other run", encoding="utf-8")
+        (sample / "input" / "initial_frame.png").write_bytes(b"other-png")
+        step = sample / "output" / "steps" / "step_003"
+        step.mkdir(parents=True)
+        (step / "video.mp4").write_bytes(b"other-video")
+
+        combined = ResultIndex([self.root, second_root])
+
+        self.assertEqual(len(combined.samples), 4)
+        self.assertEqual(combined.samples[0].sample_id, "demo_run/000002")
+        self.assertEqual(combined.samples[-1].sample_id, "second_run/000001")
+        self.assertEqual(
+            combined.step_names,
+            ["step_000", "step_001", "step_002", "step_003"],
+        )
+        item = combined.page(1, 10)["items"][-1]
+        self.assertEqual(item["run_name"], "second_run")
+        self.assertIn("/media/second_run/", item["initial_frame"])
+        media_path = item["initial_frame"].split("/media/", 1)[1].split("?", 1)[0]
+        self.assertEqual(combined.resolve_media(media_path).read_bytes(), b"other-png")
+        run_page = combined.page(1, 10, run_name="second_run")
+        self.assertEqual(run_page["total"], 1)
+        self.assertEqual(run_page["items"][0]["run_name"], "second_run")
+        with self.assertRaises(ValueError):
+            combined.page(1, 10, run_name="missing_run")
+
+        combined.save_annotation("second_run/000001", success=True)
+        annotation = json.loads((sample / "annotation.json").read_text())
+        self.assertTrue(annotation["success"])
+        with self.assertRaisesRegex(ValueError, "sample_id"):
+            combined.save_annotation("000001", success=False)
+
+    def test_multiple_result_dirs_are_naturally_sorted_by_category(self):
+        roots = []
+        for run_name in (
+            "20260822_0100_T010_wan22_custom",
+            "20260820_0100_T002_wan22_custom",
+            "20260821_0100_G-19_wan22_custom",
+            "20260820_0200_G-3_wan22_custom",
+        ):
+            root = Path(self.temp_dir.name) / run_name
+            (root / "samples").mkdir(parents=True)
+            roots.append(root)
+
+        index = ResultIndex(roots)
+
+        self.assertEqual(
+            [root.name for root in index.roots],
+            [
+                "20260820_0200_G-3_wan22_custom",
+                "20260821_0100_G-19_wan22_custom",
+                "20260820_0100_T002_wan22_custom",
+                "20260822_0100_T010_wan22_custom",
+            ],
+        )
+
     def test_page_size_parser(self):
         self.assertEqual(positive_page_size("5"), 5)
         for value in ("0", "51", "nope"):
@@ -168,6 +247,11 @@ class ResultDashboardTest(unittest.TestCase):
             with open_direct(base + "/api/samples?page=1&page_size=2", timeout=3) as response:
                 payload = json.load(response)
                 self.assertEqual(len(payload["items"]), 2)
+            with open_direct(
+                base + "/api/samples?page=1&page_size=2&cos_type=unannotated",
+                timeout=3,
+            ) as response:
+                self.assertEqual(json.load(response)["total"], 3)
             media = "/media/samples/000001/output/steps/step_000/video.mp4"
             request = Request(base + media, headers={"Range": "bytes=2-5"})
             with open_direct(request, timeout=3) as response:
@@ -197,6 +281,12 @@ class ResultDashboardTest(unittest.TestCase):
             )
             self.assertEqual(annotation["cos_type"], "Perception Before Action")
             self.assertFalse(annotation["success"])
+            with open_direct(
+                base + "/api/samples?page=1&page_size=2&success=false", timeout=3
+            ) as response:
+                filtered = json.load(response)
+                self.assertEqual(filtered["total"], 1)
+                self.assertEqual(filtered["items"][0]["task_id"], "000002")
 
             clear_request = Request(base + "/api/annotations", method="DELETE")
             with open_direct(clear_request, timeout=3) as response:
