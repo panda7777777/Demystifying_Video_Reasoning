@@ -656,7 +656,7 @@ INDEX_HTML = r'''<!doctype html>
     .annotation-select.saving { opacity:.55; }
     .annotation-error { color:#a62f25; font-size:13px; margin-top:7px; }
     th.step,td.step { width:310px; min-width:310px; }
-    img,video { display:block; width:100%; aspect-ratio:20/11; object-fit:cover; border-radius:11px; background:#101722; }
+    img,video { display:block; width:100%; height:auto; object-fit:contain; border-radius:11px; background:#101722; }
     video { box-shadow:inset 0 0 0 1px rgba(255,255,255,.12); }
     .missing { width:100%; aspect-ratio:20/11; display:grid; place-items:center; border:2px dashed #c7c2b8; border-radius:11px; color:#7b8491; background:#f1eee7; font-weight:900; }
     .empty,.error { padding:60px; font-size:22px; font-weight:900; text-align:center; }
